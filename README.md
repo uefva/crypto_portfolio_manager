@@ -16,11 +16,19 @@ python crypto_portfolio_manager.py
 python crypto_portfolio_gui.py
 ```
 
+也可以直接双击：
+
+```text
+start_gui.bat
+```
+
 ## 文件结构
 
 ```text
 crypto_portfolio_manager.py      # 程序启动入口
 crypto_portfolio_gui.py          # 图形界面启动入口
+start_gui.bat                    # 双击启动图形界面
+start_cli.bat                    # 双击启动命令行界面
 crypto_portfolio/                # 应用代码
   __init__.py
   cli.py                         # 命令行菜单和用户输入
