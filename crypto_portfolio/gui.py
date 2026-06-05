@@ -1,7 +1,11 @@
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlencode
+import threading
 import tkinter as tk
 from tkinter import messagebox, ttk
+
+import requests
 
 from crypto_portfolio.portfolio_manager import (
     COIN_MAP,
@@ -23,7 +27,9 @@ class PortfolioApp(tk.Tk):
         self.status_var = tk.StringVar(value="就绪")
         self.holding_summary_var = tk.StringVar(value="")
         self.snapshot_summary_var = tk.StringVar(value="")
+        self.chart_source_var = tk.StringVar(value="历史仓位结果")
         self.chart_metric_var = tk.StringVar(value="收益金额")
+        self.server_url_var = tk.StringVar(value="http://127.0.0.1:8765")
         self.profit_chart_data = None
         self.highlighted_symbol = None
 
@@ -56,7 +62,12 @@ class PortfolioApp(tk.Tk):
         toolbar = ttk.Frame(self.holdings_tab)
         toolbar.pack(fill="x", pady=(0, 8))
 
-        ttk.Button(toolbar, text="查询并保存", command=self.refresh_holdings).pack(side="left")
+        self.refresh_holdings_button = ttk.Button(
+            toolbar,
+            text="查询并保存",
+            command=self.refresh_holdings,
+        )
+        self.refresh_holdings_button.pack(side="left")
         ttk.Button(toolbar, text="刷新本地数据", command=self.refresh_all).pack(side="left", padx=8)
 
         columns = ("symbol", "quantity", "avg_cost", "price", "value", "profit", "rate")
@@ -244,6 +255,17 @@ class PortfolioApp(tk.Tk):
         toolbar = ttk.Frame(self.profit_chart_tab)
         toolbar.pack(fill="x", pady=(0, 8))
 
+        ttk.Label(toolbar, text="数据源").pack(side="left")
+        source_combo = ttk.Combobox(
+            toolbar,
+            textvariable=self.chart_source_var,
+            values=("历史仓位结果", "服务端价格记录"),
+            width=14,
+            state="readonly",
+        )
+        source_combo.pack(side="left", padx=8)
+        source_combo.bind("<<ComboboxSelected>>", lambda _event: self.refresh_profit_chart())
+
         ttk.Label(toolbar, text="指标").pack(side="left")
         metric_combo = ttk.Combobox(
             toolbar,
@@ -254,6 +276,9 @@ class PortfolioApp(tk.Tk):
         )
         metric_combo.pack(side="left", padx=8)
         metric_combo.bind("<<ComboboxSelected>>", lambda _event: self.refresh_profit_chart())
+
+        ttk.Label(toolbar, text="服务端").pack(side="left")
+        ttk.Entry(toolbar, textvariable=self.server_url_var, width=28).pack(side="left", padx=8)
         ttk.Button(toolbar, text="刷新图表", command=self.refresh_profit_chart).pack(side="left")
         ttk.Button(toolbar, text="清除高亮", command=self.clear_chart_highlight).pack(
             side="left", padx=8
@@ -287,16 +312,51 @@ class PortfolioApp(tk.Tk):
             messagebox.showinfo("提示", "暂无持仓。")
             return
 
-        self.status_var.set("正在查询价格...")
-        self.update_idletasks()
-        prices = self.manager.get_prices()
-        snapshot = self.manager.build_holdings_snapshot(prices)
-        snapshot_path = self.manager.save_holdings_snapshot(snapshot)
+        self.refresh_holdings_button.configure(state="disabled")
 
-        self.fill_tree(self.holdings_tree, snapshot["rows"], self.rate_tag_for_row)
-        self.holding_summary_var.set(self.format_snapshot_summary(snapshot))
-        self.refresh_snapshots()
-        self.status_var.set(f"持仓查询已保存: {snapshot_path}")
+        def task():
+            prices = self.manager.get_prices()
+            snapshot = self.manager.build_holdings_snapshot(prices)
+            snapshot_path = self.manager.save_holdings_snapshot(snapshot)
+            return snapshot, snapshot_path
+
+        def on_success(result):
+            snapshot, snapshot_path = result
+            self.fill_tree(self.holdings_tree, snapshot["rows"], self.rate_tag_for_row)
+            self.holding_summary_var.set(self.format_snapshot_summary(snapshot))
+            self.refresh_snapshots()
+            self.status_var.set(f"持仓查询已保存: {snapshot_path}")
+
+        def on_done():
+            self.refresh_holdings_button.configure(state="normal")
+
+        self.run_background(task, on_success, "正在查询价格...", on_done=on_done)
+
+    def run_background(self, task, on_success, busy_message, on_done=None):
+        self.status_var.set(busy_message)
+
+        def worker():
+            try:
+                result = task()
+            except Exception as exc:
+                self.after(0, lambda error=exc: self.handle_background_error(error, on_done))
+                return
+            self.after(0, lambda value=result: self.handle_background_success(value, on_success, on_done))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def handle_background_success(self, result, on_success, on_done):
+        try:
+            on_success(result)
+        finally:
+            if on_done:
+                on_done()
+
+    def handle_background_error(self, error, on_done):
+        if on_done:
+            on_done()
+        self.status_var.set("后台任务失败")
+        messagebox.showerror("操作失败", str(error))
 
     def refresh_transactions(self):
         transactions = self.manager.get_transactions()
@@ -441,7 +501,18 @@ class PortfolioApp(tk.Tk):
         return summary
 
     def refresh_profit_chart(self):
-        self.profit_chart_data = self.build_profit_chart_data()
+        if self.chart_source_var.get() == "服务端价格记录":
+            self.run_background(
+                self.build_server_profit_chart_data,
+                self.apply_profit_chart_data,
+                "正在从服务端读取价格历史...",
+            )
+            return
+
+        self.apply_profit_chart_data(self.build_profit_chart_data())
+
+    def apply_profit_chart_data(self, data):
+        self.profit_chart_data = data
         if self.highlighted_symbol not in self.profit_chart_data["series"]:
             self.highlighted_symbol = None
         self.draw_profit_chart()
@@ -474,6 +545,62 @@ class PortfolioApp(tk.Tk):
                 if points
             },
             "metric": metric,
+            "source": "snapshots",
+        }
+
+    def build_server_profit_chart_data(self):
+        holdings = {
+            symbol: asset.copy()
+            for symbol, asset in self.manager.data.items()
+            if asset.get("quantity", 0) > 0 and asset.get("total_cost", 0) > 0
+        }
+        metric = self.chart_metric_var.get()
+        if not holdings:
+            return {"labels": [], "series": {}, "metric": metric, "source": "server"}
+
+        server_url = self.server_url_var.get().strip().rstrip("/")
+        if not server_url:
+            raise ValueError("服务端地址不能为空。")
+
+        query = urlencode({
+            "symbols": ",".join(sorted(holdings.keys())),
+            "limit": "5000",
+        })
+        response = requests.get(
+            f"{server_url}/api/prices/history?{query}",
+            timeout=10,
+        )
+        response.raise_for_status()
+        payload = response.json()
+
+        labels = []
+        series = {}
+        for point in payload.get("points", []):
+            prices = point.get("prices", {})
+            labels.append(point.get("timestamp", "未知"))
+            point_index = len(labels) - 1
+
+            for symbol, asset in holdings.items():
+                price = prices.get(symbol)
+                if price is None:
+                    continue
+
+                profit = asset["quantity"] * float(price) - asset["total_cost"]
+                if metric == "收益率":
+                    value = profit / asset["total_cost"] * 100
+                else:
+                    value = profit
+                series.setdefault(symbol, []).append((point_index, value))
+
+        return {
+            "labels": labels,
+            "series": {
+                symbol: points
+                for symbol, points in sorted(series.items())
+                if points
+            },
+            "metric": metric,
+            "source": "server",
         }
 
     def draw_profit_chart(self):
@@ -491,10 +618,14 @@ class PortfolioApp(tk.Tk):
         width = max(canvas.winfo_width(), 760)
         height = max(canvas.winfo_height(), 420)
         if not labels or not series:
+            if data.get("source") == "server":
+                empty_text = "暂无可绘制的服务端价格记录。请先启动服务端并等待价格采集。"
+            else:
+                empty_text = "暂无可绘制的历史持仓结果。请先在“持仓”页查询并保存。"
             canvas.create_text(
                 width / 2,
                 height / 2,
-                text="暂无可绘制的历史持仓结果。请先在“持仓”页查询并保存。",
+                text=empty_text,
                 fill="#666666",
                 font=("Microsoft YaHei UI", 12),
             )

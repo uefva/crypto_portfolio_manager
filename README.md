@@ -16,10 +16,17 @@ python crypto_portfolio_manager.py
 python crypto_portfolio_gui.py
 ```
 
+价格服务端：
+
+```bash
+python crypto_price_server.py
+```
+
 也可以直接双击：
 
 ```text
 start_gui.bat
+start_server.bat
 ```
 
 ## 文件结构
@@ -27,16 +34,33 @@ start_gui.bat
 ```text
 crypto_portfolio_manager.py      # 程序启动入口
 crypto_portfolio_gui.py          # 图形界面启动入口
+crypto_price_server.py           # 价格采集服务端入口
 start_gui.bat                    # 双击启动图形界面
 start_cli.bat                    # 双击启动命令行界面
+start_server.bat                 # 双击启动价格服务端
+server_config.ini                # 服务端配置，包含币种和采集间隔
 crypto_portfolio/                # 应用代码
   __init__.py
   cli.py                         # 命令行菜单和用户输入
   gui.py                         # 图形化增删改查界面和收益走势图
+  price_server.py                # SQLite 价格服务端和 HTTP 接口
   portfolio_manager.py           # 持仓、交易、备份、价格查询逻辑
 requirements.txt                 # Python 依赖
 portfolio.json                   # 本地持仓数据，不提交到仓库
 portfolio_backups/               # 自动备份目录，不提交到仓库
 holding_snapshots/               # 持仓查询结果快照，不提交到仓库
+price_history.sqlite3            # 服务端价格历史数据库，不提交到仓库
 okx_credentials.json             # 本地凭据，不提交到仓库
+```
+
+## 价格服务端接口
+
+默认地址为 `http://127.0.0.1:8765`。
+
+```text
+GET  /api/health
+GET  /api/symbols
+GET  /api/prices/latest?symbols=BTC,ETH
+GET  /api/prices/history?symbols=BTC,ETH&limit=5000
+POST /api/refresh
 ```

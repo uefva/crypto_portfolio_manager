@@ -74,3 +74,4 @@ __pycache__
 .idea
 portfolio_backups/
 holding_snapshots/
+*.sqlite3

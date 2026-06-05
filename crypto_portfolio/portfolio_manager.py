@@ -1,5 +1,6 @@
 import json
 import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from tabulate import tabulate
@@ -18,6 +19,28 @@ COIN_MAP = {
     "PEPE": "pepe",
     "DOGE": "dogecoin",
 }
+
+OKX_SYMBOL_MAP = {
+    "BTC": "BTC-USDT",
+    "ETH": "ETH-USDT",
+    "ADA": "ADA-USDT",
+    "SOL": "SOL-USDT",
+    "SUI": "SUI-USDT",
+    "PEPE": "PEPE-USDT",
+    "DOGE": "DOGE-USDT",
+}
+
+BINANCE_SYMBOL_MAP = {
+    "BTC": "BTCUSDT",
+    "ETH": "ETHUSDT",
+    "ADA": "ADAUSDT",
+    "SOL": "SOLUSDT",
+    "SUI": "SUIUSDT",
+    "PEPE": "PEPEUSDT",
+    "DOGE": "DOGEUSDT",
+}
+
+PRICE_TIMEOUT = 4
 
 
 class PortfolioManager:
@@ -348,38 +371,103 @@ class PortfolioManager:
         if not self.data:
             return {}
 
-        ids = []
-        reverse_map = {}
-        for symbol in self.data:
-            coin_id = COIN_MAP.get(symbol)
-            if coin_id:
-                ids.append(coin_id)
-                reverse_map[coin_id] = symbol
-
-        if not ids:
-            return {}
-
-        url = "https://api.coingecko.com/api/v3/simple/price"
-        params = {
-            "ids": ",".join(ids),
-            "vs_currencies": "usd"
-        }
-
-        try:
-            resp = requests.get(url, params=params, timeout=10)
-            resp.raise_for_status()
-            raw = resp.json()
-        except Exception as e:
-            print(f"获取价格失败: {e}")
+        symbols = [
+            symbol for symbol in self.data
+            if symbol in OKX_SYMBOL_MAP or symbol in BINANCE_SYMBOL_MAP or symbol in COIN_MAP
+        ]
+        if not symbols:
             return {}
 
         prices = {}
-        for coin_id, symbol in reverse_map.items():
-            price = raw.get(coin_id, {}).get("usd")
-            if price is not None:
-                prices[symbol] = float(price)
+        futures_by_symbol = {symbol: [] for symbol in symbols}
+        future_meta = {}
+        executor = ThreadPoolExecutor(max_workers=min(len(symbols) * 3, 16))
+
+        try:
+            for symbol in symbols:
+                tasks = [
+                    ("OKX", self.fetch_okx_price),
+                    ("Binance", self.fetch_binance_price),
+                    ("CoinGecko", self.fetch_coingecko_price),
+                ]
+                for source, fetch_price in tasks:
+                    future = executor.submit(fetch_price, symbol)
+                    futures_by_symbol[symbol].append(future)
+                    future_meta[future] = (symbol, source)
+
+            resolved_symbols = set()
+            for future in as_completed(future_meta):
+                symbol, source = future_meta[future]
+                if symbol in resolved_symbols:
+                    continue
+
+                try:
+                    price = future.result()
+                except Exception as e:
+                    print(f"{source} 获取 {symbol} 价格失败: {e}")
+                    continue
+
+                if price is None:
+                    continue
+
+                prices[symbol] = price
+                resolved_symbols.add(symbol)
+
+                for other_future in futures_by_symbol[symbol]:
+                    if other_future is not future:
+                        other_future.cancel()
+
+                if len(resolved_symbols) == len(symbols):
+                    break
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
 
         return prices
+
+    def fetch_okx_price(self, symbol):
+        inst_id = OKX_SYMBOL_MAP.get(symbol)
+        if not inst_id:
+            return None
+
+        url = "https://www.okx.com/api/v5/market/ticker"
+        resp = requests.get(url, params={"instId": inst_id}, timeout=PRICE_TIMEOUT)
+        resp.raise_for_status()
+        data = resp.json().get("data", [])
+        if not data:
+            return None
+        return self.parse_price(data[0].get("last"))
+
+    def fetch_binance_price(self, symbol):
+        ticker_symbol = BINANCE_SYMBOL_MAP.get(symbol)
+        if not ticker_symbol:
+            return None
+
+        url = "https://data-api.binance.vision/api/v3/ticker/price"
+        resp = requests.get(url, params={"symbol": ticker_symbol}, timeout=PRICE_TIMEOUT)
+        resp.raise_for_status()
+        return self.parse_price(resp.json().get("price"))
+
+    def fetch_coingecko_price(self, symbol):
+        coin_id = COIN_MAP.get(symbol)
+        if not coin_id:
+            return None
+
+        url = "https://api.coingecko.com/api/v3/simple/price"
+        params = {
+            "ids": coin_id,
+            "vs_currencies": "usd"
+        }
+        resp = requests.get(url, params=params, timeout=PRICE_TIMEOUT)
+        resp.raise_for_status()
+        return self.parse_price(resp.json().get(coin_id, {}).get("usd"))
+
+    def parse_price(self, value):
+        if value is None:
+            return None
+        price = float(value)
+        if price <= 0:
+            return None
+        return price
 
     def format_quantity(self, quantity):
         return f"{quantity:.8f}".rstrip("0").rstrip(".")
