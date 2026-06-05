@@ -24,7 +24,7 @@ crypto_portfolio_gui.py          # 图形界面启动入口
 crypto_portfolio/                # 应用代码
   __init__.py
   cli.py                         # 命令行菜单和用户输入
-  gui.py                         # 图形化增删改查界面
+  gui.py                         # 图形化增删改查界面和收益走势图
   portfolio_manager.py           # 持仓、交易、备份、价格查询逻辑
 requirements.txt                 # Python 依赖
 portfolio.json                   # 本地持仓数据，不提交到仓库

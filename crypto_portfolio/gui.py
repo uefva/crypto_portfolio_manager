@@ -1,3 +1,4 @@
+from datetime import datetime
 from pathlib import Path
 import tkinter as tk
 from tkinter import messagebox, ttk
@@ -22,6 +23,9 @@ class PortfolioApp(tk.Tk):
         self.status_var = tk.StringVar(value="就绪")
         self.holding_summary_var = tk.StringVar(value="")
         self.snapshot_summary_var = tk.StringVar(value="")
+        self.chart_metric_var = tk.StringVar(value="收益金额")
+        self.profit_chart_data = None
+        self.highlighted_symbol = None
 
         self.create_widgets()
         self.refresh_all()
@@ -33,14 +37,17 @@ class PortfolioApp(tk.Tk):
         self.holdings_tab = ttk.Frame(self.notebook)
         self.transactions_tab = ttk.Frame(self.notebook)
         self.snapshots_tab = ttk.Frame(self.notebook)
+        self.profit_chart_tab = ttk.Frame(self.notebook)
 
         self.notebook.add(self.holdings_tab, text="持仓")
         self.notebook.add(self.transactions_tab, text="交易记录")
         self.notebook.add(self.snapshots_tab, text="历史持仓结果")
+        self.notebook.add(self.profit_chart_tab, text="收益走势")
 
         self.create_holdings_tab()
         self.create_transactions_tab()
         self.create_snapshots_tab()
+        self.create_profit_chart_tab()
 
         status = ttk.Label(self, textvariable=self.status_var, anchor="w")
         status.pack(fill="x", padx=10, pady=8)
@@ -82,6 +89,7 @@ class PortfolioApp(tk.Tk):
             self.holdings_tree.heading(column, text=headings[column])
             self.holdings_tree.column(column, width=widths[column], anchor=anchor)
         self.configure_rate_tags(self.holdings_tree)
+        self.configure_sortable_tree(self.holdings_tree, headings)
 
         self.holdings_tree.pack(fill="both", expand=True)
         ttk.Label(self.holdings_tab, textvariable=self.holding_summary_var, anchor="w").pack(
@@ -165,6 +173,7 @@ class PortfolioApp(tk.Tk):
             anchor = "w" if column in {"symbol", "type", "date"} else "e"
             self.transactions_tree.heading(column, text=headings[column])
             self.transactions_tree.column(column, width=widths[column], anchor=anchor)
+        self.configure_sortable_tree(self.transactions_tree, headings)
 
         self.transactions_tree.pack(fill="both", expand=True)
         self.transactions_tree.bind("<<TreeviewSelect>>", self.on_transaction_select)
@@ -191,14 +200,17 @@ class PortfolioApp(tk.Tk):
             show="headings",
             height=18,
         )
+        snapshot_headings = {}
         for column, title, width in (
             ("saved_at", "查询时间", 170),
             ("value", "总价值", 100),
             ("profit", "总收益", 100),
             ("path", "文件", 220),
         ):
+            snapshot_headings[column] = title
             self.snapshots_tree.heading(column, text=title)
             self.snapshots_tree.column(column, width=width, anchor="w")
+        self.configure_sortable_tree(self.snapshots_tree, snapshot_headings)
         self.snapshots_tree.pack(fill="both", expand=True)
         self.snapshots_tree.bind("<<TreeviewSelect>>", self.on_snapshot_select)
 
@@ -207,6 +219,7 @@ class PortfolioApp(tk.Tk):
             columns=("symbol", "quantity", "avg_cost", "price", "value", "profit", "rate"),
             show="headings",
         )
+        detail_headings = {}
         for column, title, width in (
             ("symbol", "币种", 80),
             ("quantity", "数量", 130),
@@ -216,14 +229,44 @@ class PortfolioApp(tk.Tk):
             ("profit", "总收益", 120),
             ("rate", "收益率", 100),
         ):
+            detail_headings[column] = title
             anchor = "w" if column == "symbol" else "e"
             self.snapshot_detail_tree.heading(column, text=title)
             self.snapshot_detail_tree.column(column, width=width, anchor=anchor)
         self.configure_rate_tags(self.snapshot_detail_tree)
+        self.configure_sortable_tree(self.snapshot_detail_tree, detail_headings)
         self.snapshot_detail_tree.pack(fill="both", expand=True)
         ttk.Label(right, textvariable=self.snapshot_summary_var, anchor="w").pack(
             fill="x", pady=(8, 0)
         )
+
+    def create_profit_chart_tab(self):
+        toolbar = ttk.Frame(self.profit_chart_tab)
+        toolbar.pack(fill="x", pady=(0, 8))
+
+        ttk.Label(toolbar, text="指标").pack(side="left")
+        metric_combo = ttk.Combobox(
+            toolbar,
+            textvariable=self.chart_metric_var,
+            values=("收益金额", "收益率"),
+            width=12,
+            state="readonly",
+        )
+        metric_combo.pack(side="left", padx=8)
+        metric_combo.bind("<<ComboboxSelected>>", lambda _event: self.refresh_profit_chart())
+        ttk.Button(toolbar, text="刷新图表", command=self.refresh_profit_chart).pack(side="left")
+        ttk.Button(toolbar, text="清除高亮", command=self.clear_chart_highlight).pack(
+            side="left", padx=8
+        )
+
+        self.profit_chart_canvas = tk.Canvas(
+            self.profit_chart_tab,
+            background="white",
+            highlightthickness=1,
+            highlightbackground="#d0d0d0",
+        )
+        self.profit_chart_canvas.pack(fill="both", expand=True)
+        self.profit_chart_canvas.bind("<Configure>", lambda _event: self.draw_profit_chart())
 
     def refresh_all(self):
         self.manager.data = self.manager.load_data()
@@ -280,6 +323,8 @@ class PortfolioApp(tk.Tk):
                 str(path),
             ))
         self.fill_tree(self.snapshots_tree, rows)
+        if hasattr(self, "profit_chart_canvas"):
+            self.refresh_profit_chart()
 
     def fill_tree(self, tree, rows, tag_factory=None):
         for item in tree.get_children():
@@ -287,6 +332,75 @@ class PortfolioApp(tk.Tk):
         for row in rows:
             tags = tag_factory(row) if tag_factory else ()
             tree.insert("", "end", values=row, tags=tags)
+        self.reset_sort_headings(tree)
+
+    def configure_sortable_tree(self, tree, headings):
+        tree.sort_headings = headings
+        tree.sort_state = {}
+        for column, title in headings.items():
+            tree.heading(
+                column,
+                text=title,
+                command=lambda current_column=column: self.sort_tree(tree, current_column),
+            )
+
+    def reset_sort_headings(self, tree):
+        headings = getattr(tree, "sort_headings", None)
+        if not headings:
+            return
+        tree.sort_state = {}
+        for column, title in headings.items():
+            tree.heading(
+                column,
+                text=title,
+                command=lambda current_column=column: self.sort_tree(tree, current_column),
+            )
+
+    def sort_tree(self, tree, column):
+        headings = getattr(tree, "sort_headings", {})
+        current_descending = getattr(tree, "sort_state", {}).get(column, True)
+        descending = not current_descending
+
+        items = list(tree.get_children(""))
+        items.sort(
+            key=lambda item: self.sort_value(tree.set(item, column)),
+            reverse=descending,
+        )
+        for index, item in enumerate(items):
+            tree.move(item, "", index)
+
+        tree.sort_state = {column: descending}
+        for current_column, title in headings.items():
+            suffix = ""
+            if current_column == column:
+                suffix = " ↓" if descending else " ↑"
+            tree.heading(
+                current_column,
+                text=f"{title}{suffix}",
+                command=lambda selected=current_column: self.sort_tree(tree, selected),
+            )
+
+    def sort_value(self, value):
+        text = str(value).strip()
+        if text in {"", "无法计算", "价格未知", "未知"}:
+            return (3, "")
+
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+            try:
+                return (0, datetime.strptime(text, fmt))
+            except ValueError:
+                pass
+
+        try:
+            return (1, self.parse_metric_value(text))
+        except ValueError:
+            return (2, text.upper())
+
+    def parse_metric_value(self, value):
+        text = str(value).strip().replace(",", "").replace("$", "")
+        if text.endswith("%"):
+            text = text[:-1]
+        return float(text)
 
     def configure_rate_tags(self, tree):
         tree.tag_configure("profit_positive", foreground="#c62828")
@@ -325,6 +439,220 @@ class PortfolioApp(tk.Tk):
         if unknown:
             summary += f"    未计入: {', '.join(unknown)}"
         return summary
+
+    def refresh_profit_chart(self):
+        self.profit_chart_data = self.build_profit_chart_data()
+        if self.highlighted_symbol not in self.profit_chart_data["series"]:
+            self.highlighted_symbol = None
+        self.draw_profit_chart()
+
+    def build_profit_chart_data(self):
+        snapshots = list(reversed(self.manager.list_holdings_snapshots()))
+        metric = self.chart_metric_var.get()
+        value_index = 6 if metric == "收益率" else 5
+        labels = []
+        series = {}
+
+        for _path, snapshot in snapshots:
+            saved_at = snapshot.get("saved_at", "未知")
+            labels.append(saved_at)
+            for row in snapshot.get("rows", []):
+                if len(row) <= value_index:
+                    continue
+                symbol = str(row[0])
+                try:
+                    value = self.parse_metric_value(row[value_index])
+                except ValueError:
+                    continue
+                series.setdefault(symbol, []).append((len(labels) - 1, value))
+
+        return {
+            "labels": labels,
+            "series": {
+                symbol: points
+                for symbol, points in sorted(series.items())
+                if points
+            },
+            "metric": metric,
+        }
+
+    def draw_profit_chart(self):
+        if not hasattr(self, "profit_chart_canvas"):
+            return
+
+        canvas = self.profit_chart_canvas
+        canvas.delete("all")
+
+        data = self.profit_chart_data or self.build_profit_chart_data()
+        labels = data["labels"]
+        series = data["series"]
+        metric = data["metric"]
+
+        width = max(canvas.winfo_width(), 760)
+        height = max(canvas.winfo_height(), 420)
+        if not labels or not series:
+            canvas.create_text(
+                width / 2,
+                height / 2,
+                text="暂无可绘制的历史持仓结果。请先在“持仓”页查询并保存。",
+                fill="#666666",
+                font=("Microsoft YaHei UI", 12),
+            )
+            return
+
+        left = 74
+        right = 190
+        top = 42
+        bottom = 76
+        chart_left = left
+        chart_right = width - right
+        chart_top = top
+        chart_bottom = height - bottom
+
+        values = [value for points in series.values() for _index, value in points]
+        min_value = min(values + [0])
+        max_value = max(values + [0])
+        if min_value == max_value:
+            padding = abs(max_value) * 0.1 or 1
+            min_value -= padding
+            max_value += padding
+        else:
+            padding = (max_value - min_value) * 0.08
+            min_value -= padding
+            max_value += padding
+
+        def x_for(index):
+            if len(labels) == 1:
+                return (chart_left + chart_right) / 2
+            return chart_left + index / (len(labels) - 1) * (chart_right - chart_left)
+
+        def y_for(value):
+            return chart_bottom - (
+                (value - min_value) / (max_value - min_value) * (chart_bottom - chart_top)
+            )
+
+        canvas.create_line(chart_left, chart_top, chart_left, chart_bottom, fill="#444444")
+        canvas.create_line(chart_left, chart_bottom, chart_right, chart_bottom, fill="#444444")
+
+        for step in range(6):
+            value = min_value + (max_value - min_value) * step / 5
+            y = y_for(value)
+            canvas.create_line(chart_left, y, chart_right, y, fill="#eeeeee")
+            label = f"{value:.1f}%" if metric == "收益率" else f"{value:.2f}"
+            canvas.create_text(chart_left - 10, y, text=label, anchor="e", fill="#555555")
+
+        canvas.create_text(
+            chart_left,
+            18,
+            text=(
+                f"不同币种{metric}走势"
+                + (f" - 已高亮 {self.highlighted_symbol}" if self.highlighted_symbol else "")
+            ),
+            anchor="w",
+            fill="#222222",
+            font=("Microsoft YaHei UI", 12, "bold"),
+        )
+
+        tick_count = min(6, len(labels))
+        tick_indexes = sorted(
+            {
+                round(index * (len(labels) - 1) / max(tick_count - 1, 1))
+                for index in range(tick_count)
+            }
+        )
+        for index in tick_indexes:
+            x = x_for(index)
+            canvas.create_line(x, chart_bottom, x, chart_bottom + 5, fill="#444444")
+            label = labels[index]
+            if len(label) > 16:
+                label = label[:16]
+            canvas.create_text(x, chart_bottom + 24, text=label, anchor="n", fill="#555555")
+
+        if min_value < 0 < max_value:
+            y_zero = y_for(0)
+            canvas.create_line(chart_left, y_zero, chart_right, y_zero, fill="#999999", dash=(4, 3))
+
+        colors = [
+            "#c62828",
+            "#1565c0",
+            "#2e7d32",
+            "#6a1b9a",
+            "#ef6c00",
+            "#00838f",
+            "#ad1457",
+            "#455a64",
+            "#7b1fa2",
+            "#5d4037",
+        ]
+
+        for color_index, (symbol, points) in enumerate(series.items()):
+            selected = self.highlighted_symbol == symbol
+            dimmed = self.highlighted_symbol is not None and not selected
+            color = "#cfcfcf" if dimmed else colors[color_index % len(colors)]
+            line_width = 4 if selected else 2
+            marker_radius = 5 if selected else 3
+            coords = []
+            for index, value in points:
+                x = x_for(index)
+                y = y_for(value)
+                coords.extend((x, y))
+                canvas.create_oval(
+                    x - marker_radius,
+                    y - marker_radius,
+                    x + marker_radius,
+                    y + marker_radius,
+                    fill=color,
+                    outline=color,
+                )
+            if len(coords) >= 4:
+                canvas.create_line(*coords, fill=color, width=line_width)
+
+            legend_y = chart_top + color_index * 22
+            legend_x = chart_right + 24
+            tag = f"legend_{symbol}"
+            canvas.create_line(
+                legend_x,
+                legend_y,
+                legend_x + 22,
+                legend_y,
+                fill=color,
+                width=4 if selected else 3,
+                tags=(tag, "legend_item"),
+            )
+            text_item = canvas.create_text(
+                legend_x + 30,
+                legend_y,
+                text=f"{symbol} 选中" if selected else symbol,
+                anchor="w",
+                fill="#111111" if selected else "#333333",
+                font=("Microsoft YaHei UI", 9, "bold") if selected else ("Microsoft YaHei UI", 9),
+                tags=(tag, "legend_item"),
+            )
+            bbox = canvas.bbox(text_item)
+            if bbox:
+                canvas.create_rectangle(
+                    legend_x - 6,
+                    bbox[1] - 4,
+                    legend_x + 118,
+                    bbox[3] + 4,
+                    outline="#999999" if selected else "",
+                    fill="",
+                    tags=(tag, "legend_item"),
+                )
+            canvas.tag_bind(tag, "<Button-1>", lambda _event, sym=symbol: self.toggle_chart_highlight(sym))
+            canvas.tag_bind(tag, "<Enter>", lambda _event: canvas.configure(cursor="hand2"))
+            canvas.tag_bind(tag, "<Leave>", lambda _event: canvas.configure(cursor=""))
+
+    def toggle_chart_highlight(self, symbol):
+        if self.highlighted_symbol == symbol:
+            self.highlighted_symbol = None
+        else:
+            self.highlighted_symbol = symbol
+        self.draw_profit_chart()
+
+    def clear_chart_highlight(self):
+        self.highlighted_symbol = None
+        self.draw_profit_chart()
 
     def parse_trade_form(self):
         symbol = self.symbol_var.get().strip().upper()
