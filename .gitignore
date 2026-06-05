@@ -70,3 +70,5 @@ Testing/
 
 __pycache__
 *.json
+
+.idea

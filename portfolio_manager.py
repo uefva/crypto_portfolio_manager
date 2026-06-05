@@ -5,6 +5,8 @@ from pathlib import Path
 from tabulate import tabulate
 
 DATA_FILE = "portfolio.json"
+BACKUP_DIR = "portfolio_backups"
+MAX_BACKUPS = 100
 
 COIN_MAP = {
     "BTC": "bitcoin",
@@ -31,12 +33,84 @@ class PortfolioManager:
     def save_data(self):
         with open(DATA_FILE, "w", encoding="utf-8") as f:
             json.dump(self.data, f, ensure_ascii=False, indent=2)
+        self.backup_data()
+
+    def backup_data(self):
+        data_path = Path(DATA_FILE)
+        if not data_path.exists():
+            return
+
+        backup_dir = Path(BACKUP_DIR)
+        backup_dir.mkdir(exist_ok=True)
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        backup_path = backup_dir / f"{data_path.stem}_{timestamp}{data_path.suffix}"
+        with open(backup_path, "w", encoding="utf-8") as f:
+            json.dump(self.data, f, ensure_ascii=False, indent=2)
+
+        backups = sorted(
+            backup_dir.glob(f"{data_path.stem}_*{data_path.suffix}"),
+            key=lambda path: path.name
+        )
+        for old_backup in backups[:-MAX_BACKUPS]:
+            old_backup.unlink()
 
     def now(self):
         return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    def buy(self, symbol, amount, price):
-        symbol = symbol.upper()
+    def normalize_trade_date(self, trade_date=None):
+        if trade_date is None or str(trade_date).strip() == "":
+            return self.now()
+
+        trade_date = str(trade_date).strip()
+        formats = [
+            "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%d %H:%M",
+            "%Y-%m-%d"
+        ]
+        for fmt in formats:
+            try:
+                parsed = datetime.strptime(trade_date, fmt)
+                return parsed.strftime("%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                pass
+
+        print("日期格式无效，请使用 YYYY-MM-DD 或 YYYY-MM-DD HH:MM:SS。")
+        return None
+
+    def validate_trade(self, symbol, amount, price):
+        symbol = symbol.upper().strip()
+        if not symbol:
+            print("币种不能为空。")
+            return None
+        if amount <= 0 or price <= 0:
+            print("数量和价格必须大于 0。")
+            return None
+        return symbol
+
+    def get_symbols(self):
+        return sorted(self.data.keys())
+
+    def get_buy_transactions(self, symbol):
+        symbol = symbol.upper().strip()
+        if symbol not in self.data:
+            return []
+
+        buys = []
+        for index, tx in enumerate(self.data[symbol].get("transactions", [])):
+            if tx.get("type") == "buy":
+                buys.append((index, tx))
+        return buys
+
+    def buy(self, symbol, amount, price, trade_date=None):
+        symbol = self.validate_trade(symbol, amount, price)
+        if symbol is None:
+            return
+
+        trade_date = self.normalize_trade_date(trade_date)
+        if trade_date is None:
+            return
+
         total = amount * price
 
         if symbol not in self.data:
@@ -52,7 +126,7 @@ class PortfolioManager:
 
         asset["transactions"].append({
             "type": "buy",
-            "date": self.now(),
+            "date": trade_date,
             "amount": amount,
             "price": price,
             "total": total
@@ -61,8 +135,77 @@ class PortfolioManager:
         self.save_data()
         print("买入记录已保存。")
 
+    def delete_buy_order(self, symbol, transaction_index):
+        symbol = symbol.upper().strip()
+        if symbol not in self.data:
+            print("未找到该币种。")
+            return False
+
+        transactions = self.data[symbol].get("transactions", [])
+        if transaction_index < 0 or transaction_index >= len(transactions):
+            print("未找到该买入订单。")
+            return False
+
+        tx = transactions[transaction_index]
+        if tx.get("type") != "buy":
+            print("只能删除买入订单。")
+            return False
+
+        new_transactions = [
+            item for index, item in enumerate(transactions)
+            if index != transaction_index
+        ]
+        rebuilt = self.rebuild_asset(new_transactions)
+        if rebuilt is None:
+            print("删除失败：删除该买入订单后，后续卖出数量会超过持仓。原有账单未改变。")
+            return False
+
+        quantity, total_cost = rebuilt
+        if not new_transactions:
+            del self.data[symbol]
+        else:
+            self.data[symbol]["transactions"] = new_transactions
+            self.data[symbol]["quantity"] = quantity
+            self.data[symbol]["total_cost"] = total_cost
+
+        self.save_data()
+        print("买入订单已删除。")
+        return True
+
+    def rebuild_asset(self, transactions):
+        quantity = 0.0
+        total_cost = 0.0
+
+        for tx in transactions:
+            amount = tx.get("amount", 0)
+            price = tx.get("price", 0)
+            if amount <= 0 or price <= 0:
+                print("账单中存在无效数量或价格，无法重算持仓。")
+                return None
+
+            if tx.get("type") == "buy":
+                quantity += amount
+                total_cost += amount * price
+            elif tx.get("type") == "sell":
+                if amount > quantity + 1e-12:
+                    return None
+                avg_cost = total_cost / quantity if quantity > 0 else 0.0
+                quantity -= amount
+                total_cost -= avg_cost * amount
+            else:
+                print("账单中存在未知交易类型，无法重算持仓。")
+                return None
+
+            if abs(quantity) < 1e-12:
+                quantity = 0.0
+                total_cost = 0.0
+
+        return quantity, total_cost
+
     def sell(self, symbol, amount, price):
-        symbol = symbol.upper()
+        symbol = self.validate_trade(symbol, amount, price)
+        if symbol is None:
+            return
 
         if symbol not in self.data:
             print("没有该币种持仓。")
@@ -127,7 +270,9 @@ class PortfolioManager:
 
         prices = {}
         for coin_id, symbol in reverse_map.items():
-            prices[symbol] = raw.get(coin_id, {}).get("usd", 0.0)
+            price = raw.get(coin_id, {}).get("usd")
+            if price is not None:
+                prices[symbol] = float(price)
 
         return prices
 
@@ -142,18 +287,35 @@ class PortfolioManager:
         rows = []
         total_value = 0.0
         total_profit = 0.0
+        total_cost_for_priced_assets = 0.0
+        unknown_price_symbols = []
 
         for symbol, asset in self.data.items():
             quantity = asset["quantity"]
             total_cost = asset["total_cost"]
             avg_cost = total_cost / quantity if quantity > 0 else 0.0
-            current_price = prices.get(symbol, 0.0)
+            current_price = prices.get(symbol)
+
+            if current_price is None:
+                unknown_price_symbols.append(symbol)
+                rows.append([
+                    symbol,
+                    f"{quantity:.8f}".rstrip("0").rstrip("."),
+                    f"{avg_cost:.4f}",
+                    "价格未知",
+                    "无法计算",
+                    "无法计算",
+                    "无法计算"
+                ])
+                continue
+
             value = quantity * current_price
             profit = value - total_cost
             profit_rate = (profit / total_cost * 100) if total_cost > 0 else 0.0
 
             total_value += value
             total_profit += profit
+            total_cost_for_priced_assets += total_cost
 
             rows.append([
                 symbol,
@@ -168,14 +330,22 @@ class PortfolioManager:
         print(tabulate(
             rows,
             headers=["币种", "数量", "成本价", "当前价", "持仓价值", "总收益", "收益率"],
-            tablefmt="grid"
+            tablefmt="grid",
+            colalign=("left", "right", "right", "right", "right", "right", "right"),
+            disable_numparse=True
         ))
 
-        total_cost = total_value - total_profit
-        total_profit_rate = (total_profit / total_cost * 100) if total_cost > 0 else 0.0
+        total_profit_rate = (
+            total_profit / total_cost_for_priced_assets * 100
+            if total_cost_for_priced_assets > 0 else 0.0
+        )
 
-        print(f"\n总持仓价值: ${total_value:.2f}")
-        print(f"总收益: {total_profit:.2f} ({total_profit_rate:.2f}%)")
+        total_label = "可计算总持仓价值" if unknown_price_symbols else "总持仓价值"
+        profit_label = "可计算总收益" if unknown_price_symbols else "总收益"
+        print(f"\n{total_label}: ${total_value:.2f}")
+        print(f"{profit_label}: {total_profit:.2f} ({total_profit_rate:.2f}%)")
+        if unknown_price_symbols:
+            print(f"价格未知，未计入汇总: {', '.join(unknown_price_symbols)}")
 
     def show_history(self, symbol=""):
         symbol = symbol.upper().strip()
@@ -224,14 +394,21 @@ class PortfolioManager:
 
         values = {}
         total_value = 0.0
+        unknown_price_symbols = []
 
         for symbol, asset in self.data.items():
-            value = asset["quantity"] * prices.get(symbol, 0.0)
+            current_price = prices.get(symbol)
+            if current_price is None:
+                unknown_price_symbols.append(symbol)
+                continue
+            value = asset["quantity"] * current_price
             values[symbol] = value
             total_value += value
 
         if total_value <= 0:
-            print("总资产为 0。")
+            print("可计算总资产为 0，无法展示资产分布。")
+            if unknown_price_symbols:
+                print(f"价格未知，未计入资产分布: {', '.join(unknown_price_symbols)}")
             return
 
         print("\n资产分布:")
@@ -239,4 +416,7 @@ class PortfolioManager:
             pct = value / total_value * 100
             print(f"{symbol}: {value:.2f} ({pct:.1f}%)")
 
-        print(f"总价值: ${total_value:.2f}")
+        total_label = "可计算总价值" if unknown_price_symbols else "总价值"
+        print(f"{total_label}: ${total_value:.2f}")
+        if unknown_price_symbols:
+            print(f"价格未知，未计入资产分布: {', '.join(unknown_price_symbols)}")
