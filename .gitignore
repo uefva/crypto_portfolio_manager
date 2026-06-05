@@ -72,3 +72,4 @@ __pycache__
 *.json
 
 .idea
+portfolio_backups/

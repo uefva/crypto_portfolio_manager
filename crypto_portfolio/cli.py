@@ -1,4 +1,4 @@
-from portfolio_manager import COIN_MAP, PortfolioManager
+from crypto_portfolio.portfolio_manager import COIN_MAP, PortfolioManager
 
 
 def input_positive_float(prompt):
