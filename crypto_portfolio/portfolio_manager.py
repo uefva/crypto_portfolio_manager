@@ -103,14 +103,112 @@ class PortfolioManager:
                 buys.append((index, tx))
         return buys
 
-    def buy(self, symbol, amount, price, trade_date=None):
-        symbol = self.validate_trade(symbol, amount, price)
-        if symbol is None:
-            return
+    def get_transactions(self, symbol=""):
+        symbol = symbol.upper().strip()
+        if symbol and symbol not in self.data:
+            return []
+
+        assets = {symbol: self.data[symbol]} if symbol else self.data
+        transactions = []
+        for sym, asset in assets.items():
+            for index, tx in enumerate(asset.get("transactions", [])):
+                transactions.append({
+                    "symbol": sym,
+                    "index": index,
+                    "type": tx.get("type", ""),
+                    "date": tx.get("date", ""),
+                    "amount": tx.get("amount", 0),
+                    "price": tx.get("price", 0),
+                    "total": tx.get("total", 0),
+                })
+
+        return sorted(transactions, key=lambda item: item["date"])
+
+    def update_transaction(self, symbol, transaction_index, tx_type, amount, price, trade_date):
+        symbol = symbol.upper().strip()
+        tx_type = tx_type.strip().lower()
+        if tx_type not in {"buy", "sell"}:
+            print("交易类型必须是 buy 或 sell。")
+            return False
+
+        if self.validate_trade(symbol, amount, price) is None:
+            return False
 
         trade_date = self.normalize_trade_date(trade_date)
         if trade_date is None:
-            return
+            return False
+
+        if symbol not in self.data:
+            print("未找到该币种。")
+            return False
+
+        transactions = self.data[symbol].get("transactions", [])
+        if transaction_index < 0 or transaction_index >= len(transactions):
+            print("未找到该交易记录。")
+            return False
+
+        new_transactions = [item.copy() for item in transactions]
+        new_transactions[transaction_index] = {
+            "type": tx_type,
+            "date": trade_date,
+            "amount": amount,
+            "price": price,
+            "total": amount * price
+        }
+
+        rebuilt = self.rebuild_asset(new_transactions)
+        if rebuilt is None:
+            print("修改失败：修改后账单会导致卖出数量超过持仓，原有账单未改变。")
+            return False
+
+        quantity, total_cost = rebuilt
+        self.data[symbol]["transactions"] = new_transactions
+        self.data[symbol]["quantity"] = quantity
+        self.data[symbol]["total_cost"] = total_cost
+        self.save_data()
+        print("交易记录已更新。")
+        return True
+
+    def delete_transaction(self, symbol, transaction_index):
+        symbol = symbol.upper().strip()
+        if symbol not in self.data:
+            print("未找到该币种。")
+            return False
+
+        transactions = self.data[symbol].get("transactions", [])
+        if transaction_index < 0 or transaction_index >= len(transactions):
+            print("未找到该交易记录。")
+            return False
+
+        new_transactions = [
+            item for index, item in enumerate(transactions)
+            if index != transaction_index
+        ]
+        rebuilt = self.rebuild_asset(new_transactions)
+        if rebuilt is None:
+            print("删除失败：删除后账单会导致卖出数量超过持仓，原有账单未改变。")
+            return False
+
+        quantity, total_cost = rebuilt
+        if not new_transactions:
+            del self.data[symbol]
+        else:
+            self.data[symbol]["transactions"] = new_transactions
+            self.data[symbol]["quantity"] = quantity
+            self.data[symbol]["total_cost"] = total_cost
+
+        self.save_data()
+        print("交易记录已删除。")
+        return True
+
+    def buy(self, symbol, amount, price, trade_date=None):
+        symbol = self.validate_trade(symbol, amount, price)
+        if symbol is None:
+            return False
+
+        trade_date = self.normalize_trade_date(trade_date)
+        if trade_date is None:
+            return False
 
         total = amount * price
 
@@ -135,6 +233,7 @@ class PortfolioManager:
 
         self.save_data()
         print("买入记录已保存。")
+        return True
 
     def delete_buy_order(self, symbol, transaction_index):
         symbol = symbol.upper().strip()
@@ -203,20 +302,24 @@ class PortfolioManager:
 
         return quantity, total_cost
 
-    def sell(self, symbol, amount, price):
+    def sell(self, symbol, amount, price, trade_date=None):
         symbol = self.validate_trade(symbol, amount, price)
         if symbol is None:
-            return
+            return False
+
+        trade_date = self.normalize_trade_date(trade_date)
+        if trade_date is None:
+            return False
 
         if symbol not in self.data:
             print("没有该币种持仓。")
-            return
+            return False
 
         asset = self.data[symbol]
 
         if amount > asset["quantity"]:
             print("卖出数量超过持仓。")
-            return
+            return False
 
         avg_cost = asset["total_cost"] / asset["quantity"] if asset["quantity"] > 0 else 0
         cost_reduction = avg_cost * amount
@@ -227,7 +330,7 @@ class PortfolioManager:
 
         asset["transactions"].append({
             "type": "sell",
-            "date": self.now(),
+            "date": trade_date,
             "amount": amount,
             "price": price,
             "total": total
@@ -239,6 +342,7 @@ class PortfolioManager:
 
         self.save_data()
         print("卖出记录已保存。")
+        return True
 
     def get_prices(self):
         if not self.data:
