@@ -97,6 +97,23 @@ def choose_buy_order(manager, symbol):
     return choose_option("选择要删除的买入订单", options)
 
 
+def choose_holdings_snapshot(manager):
+    snapshots = manager.list_holdings_snapshots()
+    if not snapshots:
+        print("暂无历史持仓查询结果。")
+        return None
+
+    options = []
+    for path, snapshot in snapshots:
+        saved_at = snapshot.get("saved_at", "未知时间")
+        total_value = snapshot.get("total_value", 0.0)
+        total_profit = snapshot.get("total_profit", 0.0)
+        label = f"{saved_at} | 总价值 ${total_value:.2f} | 总收益 {total_profit:.2f}"
+        options.append((label, path))
+
+    return choose_option("选择历史持仓查询结果", options)
+
+
 def main():
     manager = PortfolioManager()
 
@@ -110,7 +127,8 @@ def main():
         print("4. 交易历史")
         print("5. 资产分布")
         print("6. 删除买入订单")
-        print("7. 退出")
+        print("7. 查看历史持仓结果")
+        print("8. 退出")
 
         choice = input("请选择操作: ").strip()
 
@@ -157,6 +175,12 @@ def main():
                 print("已取消删除。")
 
         elif choice == "7":
+            snapshot_path = choose_holdings_snapshot(manager)
+            if snapshot_path is None:
+                continue
+            manager.show_saved_holdings_snapshot(snapshot_path)
+
+        elif choice == "8":
             print("再见！")
             break
 

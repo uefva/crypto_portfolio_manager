@@ -19,5 +19,6 @@ crypto_portfolio/                # 应用代码
 requirements.txt                 # Python 依赖
 portfolio.json                   # 本地持仓数据，不提交到仓库
 portfolio_backups/               # 自动备份目录，不提交到仓库
+holding_snapshots/               # 持仓查询结果快照，不提交到仓库
 okx_credentials.json             # 本地凭据，不提交到仓库
 ```

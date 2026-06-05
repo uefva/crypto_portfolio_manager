@@ -7,6 +7,7 @@ from tabulate import tabulate
 DATA_FILE = "portfolio.json"
 BACKUP_DIR = "portfolio_backups"
 MAX_BACKUPS = 100
+HOLDING_SNAPSHOT_DIR = "holding_snapshots"
 
 COIN_MAP = {
     "BTC": "bitcoin",
@@ -276,14 +277,19 @@ class PortfolioManager:
 
         return prices
 
-    def show_holdings(self):
-        if not self.data:
-            print("暂无持仓。")
-            return
+    def format_quantity(self, quantity):
+        return f"{quantity:.8f}".rstrip("0").rstrip(".")
 
-        print("正在查询当前最新价格......")
-        prices = self.get_prices()
+    def print_holdings_table(self, rows):
+        print(tabulate(
+            rows,
+            headers=["币种", "数量", "成本价", "当前价", "持仓价值", "总收益", "收益率"],
+            tablefmt="grid",
+            colalign=("left", "right", "right", "right", "right", "right", "right"),
+            disable_numparse=True
+        ))
 
+    def build_holdings_snapshot(self, prices):
         rows = []
         total_value = 0.0
         total_profit = 0.0
@@ -300,7 +306,7 @@ class PortfolioManager:
                 unknown_price_symbols.append(symbol)
                 rows.append([
                     symbol,
-                    f"{quantity:.8f}".rstrip("0").rstrip("."),
+                    self.format_quantity(quantity),
                     f"{avg_cost:.4f}",
                     "价格未知",
                     "无法计算",
@@ -319,7 +325,7 @@ class PortfolioManager:
 
             rows.append([
                 symbol,
-                f"{quantity:.8f}".rstrip("0").rstrip("."),
+                self.format_quantity(quantity),
                 f"{avg_cost:.4f}",
                 f"{current_price:.4f}",
                 f"{value:.2f}",
@@ -327,25 +333,80 @@ class PortfolioManager:
                 f"{profit_rate:.2f}%"
             ])
 
-        print(tabulate(
-            rows,
-            headers=["币种", "数量", "成本价", "当前价", "持仓价值", "总收益", "收益率"],
-            tablefmt="grid",
-            colalign=("left", "right", "right", "right", "right", "right", "right"),
-            disable_numparse=True
-        ))
-
         total_profit_rate = (
             total_profit / total_cost_for_priced_assets * 100
             if total_cost_for_priced_assets > 0 else 0.0
         )
 
+        return {
+            "saved_at": self.now(),
+            "rows": rows,
+            "total_value": total_value,
+            "total_profit": total_profit,
+            "total_profit_rate": total_profit_rate,
+            "unknown_price_symbols": unknown_price_symbols
+        }
+
+    def save_holdings_snapshot(self, snapshot):
+        snapshot_dir = Path(HOLDING_SNAPSHOT_DIR)
+        snapshot_dir.mkdir(exist_ok=True)
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        snapshot_path = snapshot_dir / f"holdings_{timestamp}.json"
+        with open(snapshot_path, "w", encoding="utf-8") as f:
+            json.dump(snapshot, f, ensure_ascii=False, indent=2)
+
+        return snapshot_path
+
+    def print_holdings_snapshot(self, snapshot):
+        rows = snapshot["rows"]
+        unknown_price_symbols = snapshot.get("unknown_price_symbols", [])
+
+        self.print_holdings_table(rows)
+
         total_label = "可计算总持仓价值" if unknown_price_symbols else "总持仓价值"
         profit_label = "可计算总收益" if unknown_price_symbols else "总收益"
-        print(f"\n{total_label}: ${total_value:.2f}")
-        print(f"{profit_label}: {total_profit:.2f} ({total_profit_rate:.2f}%)")
+        print(f"\n{total_label}: ${snapshot['total_value']:.2f}")
+        print(
+            f"{profit_label}: {snapshot['total_profit']:.2f} "
+            f"({snapshot['total_profit_rate']:.2f}%)"
+        )
         if unknown_price_symbols:
             print(f"价格未知，未计入汇总: {', '.join(unknown_price_symbols)}")
+
+    def list_holdings_snapshots(self):
+        snapshot_dir = Path(HOLDING_SNAPSHOT_DIR)
+        if not snapshot_dir.exists():
+            return []
+
+        snapshots = []
+        for path in sorted(snapshot_dir.glob("holdings_*.json"), reverse=True):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    snapshot = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                continue
+            snapshots.append((path, snapshot))
+        return snapshots
+
+    def show_saved_holdings_snapshot(self, snapshot_path):
+        with open(snapshot_path, "r", encoding="utf-8") as f:
+            snapshot = json.load(f)
+
+        print(f"\n查询时间: {snapshot.get('saved_at', '未知')}")
+        self.print_holdings_snapshot(snapshot)
+
+    def show_holdings(self):
+        if not self.data:
+            print("暂无持仓。")
+            return
+
+        print("正在查询当前最新价格......")
+        prices = self.get_prices()
+        snapshot = self.build_holdings_snapshot(prices)
+        self.print_holdings_snapshot(snapshot)
+        snapshot_path = self.save_holdings_snapshot(snapshot)
+        print(f"本次查询结果已保存: {snapshot_path}")
 
     def show_history(self, symbol=""):
         symbol = symbol.upper().strip()
