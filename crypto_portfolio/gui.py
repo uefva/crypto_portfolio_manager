@@ -1,7 +1,8 @@
 from datetime import datetime, timedelta
 from pathlib import Path
-from urllib.parse import urlencode
+from urllib.parse import urlparse
 import threading
+import time
 import tkinter as tk
 from tkinter import messagebox, ttk
 
@@ -30,7 +31,7 @@ class PortfolioApp(tk.Tk):
         self.chart_source_var = tk.StringVar(value="历史仓位结果")
         self.chart_metric_var = tk.StringVar(value="收益金额")
         self.chart_range_var = tk.StringVar(value="全部时间")
-        self.server_url_var = tk.StringVar(value="http://127.0.0.1:8765")
+        self.server_url_var = tk.StringVar(value="http://687pq84al732.vicp.fun:22514")
         self.profit_chart_data = None
         self.profit_chart_layout = None
         self.highlighted_symbol = None
@@ -305,8 +306,33 @@ class PortfolioApp(tk.Tk):
         self.chart_symbol_panel.pack(side="right", fill="y", padx=(8, 0))
         self.chart_symbol_panel.pack_propagate(False)
         self.chart_symbol_panel.configure(width=150)
-        self.chart_symbol_list_frame = ttk.Frame(self.chart_symbol_panel)
-        self.chart_symbol_list_frame.pack(fill="both", expand=True)
+        self.chart_symbol_canvas = tk.Canvas(
+            self.chart_symbol_panel,
+            highlightthickness=0,
+            width=126,
+        )
+        self.chart_symbol_scrollbar = ttk.Scrollbar(
+            self.chart_symbol_panel,
+            orient="vertical",
+            command=self.chart_symbol_canvas.yview,
+        )
+        self.chart_symbol_canvas.configure(yscrollcommand=self.chart_symbol_scrollbar.set)
+        self.chart_symbol_scrollbar.pack(side="right", fill="y")
+        self.chart_symbol_canvas.pack(side="left", fill="both", expand=True)
+        self.chart_symbol_list_frame = ttk.Frame(self.chart_symbol_canvas)
+        self.chart_symbol_window = self.chart_symbol_canvas.create_window(
+            (0, 0),
+            window=self.chart_symbol_list_frame,
+            anchor="nw",
+        )
+        self.chart_symbol_list_frame.bind(
+            "<Configure>",
+            lambda _event: self.chart_symbol_canvas.configure(
+                scrollregion=self.chart_symbol_canvas.bbox("all")
+            ),
+        )
+        self.chart_symbol_canvas.bind("<Configure>", self.on_chart_symbol_canvas_configure)
+        self.chart_symbol_canvas.bind("<MouseWheel>", self.on_chart_symbol_mousewheel)
 
         self.profit_chart_canvas = tk.Canvas(
             chart_body,
@@ -599,27 +625,16 @@ class PortfolioApp(tk.Tk):
         if not holdings:
             return {"labels": [], "series": {}, "metric": metric, "source": "server"}
 
-        server_url = self.server_url_var.get().strip().rstrip("/")
-        if not server_url:
-            raise ValueError("服务端地址不能为空。")
+        server_url = self.normalize_server_url()
 
-        query = urlencode({
+        params = {
             "symbols": ",".join(sorted(holdings.keys())),
             "limit": "5000",
-        })
+        }
         range_start = self.get_chart_range_start()
         if range_start:
-            query = urlencode({
-                "symbols": ",".join(sorted(holdings.keys())),
-                "limit": "5000",
-                "start": range_start.strftime("%Y-%m-%d %H:%M:%S"),
-            })
-        response = requests.get(
-            f"{server_url}/api/prices/history?{query}",
-            timeout=10,
-        )
-        response.raise_for_status()
-        payload = response.json()
+            params["start"] = range_start.strftime("%Y-%m-%d %H:%M:%S")
+        payload = self.fetch_server_json(server_url, "/api/prices/history", params)
 
         labels = []
         series = {}
@@ -673,6 +688,54 @@ class PortfolioApp(tk.Tk):
             "source": "server",
         }
 
+    def normalize_server_url(self):
+        server_url = self.server_url_var.get().strip().rstrip("/")
+        if not server_url:
+            raise ValueError("服务端地址不能为空。")
+
+        if "://" not in server_url:
+            server_url = f"http://{server_url}"
+
+        parsed = urlparse(server_url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("服务端地址格式不正确，请使用 http://域名:端口。")
+        return server_url
+
+    def fetch_server_json(self, server_url, path, params):
+        url = f"{server_url}{path}"
+        session = requests.Session()
+        session.trust_env = False
+        last_error = None
+        last_response = None
+        try:
+            for attempt in range(3):
+                try:
+                    response = session.get(url, params=params, timeout=10)
+                    last_response = response
+                    response.raise_for_status()
+                    return response.json()
+                except (requests.exceptions.RequestException, ValueError) as exc:
+                    last_error = exc
+                    if attempt < 2:
+                        time.sleep(0.5 * (attempt + 1))
+                        continue
+                    raise
+        except requests.exceptions.Timeout as exc:
+            raise ValueError(f"服务端请求超时: {url}") from exc
+        except requests.exceptions.ConnectionError as exc:
+            raise ValueError(f"无法连接服务端: {url}") from exc
+        except requests.exceptions.HTTPError as exc:
+            status_code = exc.response.status_code if exc.response is not None else "未知"
+            raise ValueError(f"服务端返回错误状态 {status_code}: {url}") from exc
+        except ValueError as exc:
+            detail = ""
+            response = getattr(last_error, "response", None) or last_response
+            if response is not None:
+                detail = f"，返回类型: {response.headers.get('content-type', '未知')}"
+            raise ValueError(f"服务端返回内容不是有效 JSON{detail}: {url}") from exc
+        finally:
+            session.close()
+
     def chart_symbol_sort_key(self, item):
         symbol = item[0] if isinstance(item, tuple) else item
         if symbol == "总收益":
@@ -718,6 +781,15 @@ class PortfolioApp(tk.Tk):
             for index, symbol in enumerate(sorted_symbols)
         }
 
+    def on_chart_symbol_canvas_configure(self, event):
+        if hasattr(self, "chart_symbol_window"):
+            self.chart_symbol_canvas.itemconfigure(self.chart_symbol_window, width=event.width)
+
+    def on_chart_symbol_mousewheel(self, event):
+        if not hasattr(self, "chart_symbol_canvas"):
+            return
+        self.chart_symbol_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
     def update_chart_symbol_selector(self, available_symbols):
         available_symbols = sorted(available_symbols, key=self.chart_symbol_sort_key)
         if not hasattr(self, "chart_symbol_list_frame"):
@@ -748,6 +820,7 @@ class PortfolioApp(tk.Tk):
         for symbol in available_symbols:
             row = ttk.Frame(self.chart_symbol_list_frame)
             row.pack(fill="x", pady=2)
+            row.bind("<MouseWheel>", self.on_chart_symbol_mousewheel)
 
             swatch = tk.Label(
                 row,
@@ -758,6 +831,7 @@ class PortfolioApp(tk.Tk):
             )
             swatch.pack(side="left")
             swatch.bind("<Button-1>", lambda _event, sym=symbol: self.toggle_chart_highlight(sym))
+            swatch.bind("<MouseWheel>", self.on_chart_symbol_mousewheel)
 
             label = f"{symbol} 选中" if self.highlighted_symbol == symbol else symbol
             checkbutton = ttk.Checkbutton(
@@ -767,6 +841,7 @@ class PortfolioApp(tk.Tk):
                 command=self.on_chart_symbol_selection_changed,
             )
             checkbutton.pack(side="left", fill="x", expand=True)
+            checkbutton.bind("<MouseWheel>", self.on_chart_symbol_mousewheel)
 
     def get_selected_chart_symbols(self, available_symbols):
         selected = [
