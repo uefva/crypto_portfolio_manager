@@ -31,7 +31,7 @@ class PortfolioApp(tk.Tk):
         self.chart_source_var = tk.StringVar(value="历史仓位结果")
         self.chart_metric_var = tk.StringVar(value="收益金额")
         self.chart_range_var = tk.StringVar(value="全部时间")
-        self.server_url_var = tk.StringVar(value="http://687pq84al732.vicp.fun:22514")
+        self.server_url_var = tk.StringVar(value="http://687pq84al732.vicp.fun:47649")
         self.profit_chart_data = None
         self.profit_chart_layout = None
         self.highlighted_symbol = None
