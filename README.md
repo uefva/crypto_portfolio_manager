@@ -22,6 +22,19 @@ python crypto_portfolio_gui.py
 python crypto_price_server.py
 ```
 
+Linux 后台重启价格服务：
+
+```bash
+chmod +x scripts/restart_server.sh
+scripts/restart_server.sh
+```
+
+脚本使用的启动命令等价于：
+
+```bash
+nohup .venv/bin/python -u crypto_price_server.py > server.log 2>&1 &
+```
+
 也可以直接双击：
 
 ```text

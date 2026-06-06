@@ -374,8 +374,19 @@ def make_handler(config_path, collector):
             self.end_headers()
             self.wfile.write(body)
 
+        def get_client_ip(self):
+            for header in ("CF-Connecting-IP", "X-Real-IP", "X-Forwarded-For"):
+                value = self.headers.get(header)
+                if value:
+                    return value.split(",")[0].strip()
+            return self.client_address[0]
+
         def log_message(self, format, *args):
-            print(f"{self.address_string()} - {format % args}")
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            client_ip = self.get_client_ip()
+            peer_ip = self.client_address[0]
+            peer_info = f" (peer {peer_ip})" if client_ip != peer_ip else ""
+            print(f"[{timestamp}] {client_ip}{peer_info} - {format % args}")
 
     return PriceRequestHandler
 
