@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlencode
 import threading
@@ -29,9 +29,12 @@ class PortfolioApp(tk.Tk):
         self.snapshot_summary_var = tk.StringVar(value="")
         self.chart_source_var = tk.StringVar(value="历史仓位结果")
         self.chart_metric_var = tk.StringVar(value="收益金额")
+        self.chart_range_var = tk.StringVar(value="全部时间")
         self.server_url_var = tk.StringVar(value="http://127.0.0.1:8765")
         self.profit_chart_data = None
+        self.profit_chart_layout = None
         self.highlighted_symbol = None
+        self.chart_symbol_vars = {}
 
         self.create_widgets()
         self.refresh_all()
@@ -277,6 +280,17 @@ class PortfolioApp(tk.Tk):
         metric_combo.pack(side="left", padx=8)
         metric_combo.bind("<<ComboboxSelected>>", lambda _event: self.refresh_profit_chart())
 
+        ttk.Label(toolbar, text="范围").pack(side="left")
+        range_combo = ttk.Combobox(
+            toolbar,
+            textvariable=self.chart_range_var,
+            values=("过去一天", "过去一周", "过去一个月", "过去半年", "过去一年", "全部时间"),
+            width=12,
+            state="readonly",
+        )
+        range_combo.pack(side="left", padx=8)
+        range_combo.bind("<<ComboboxSelected>>", lambda _event: self.refresh_profit_chart())
+
         ttk.Label(toolbar, text="服务端").pack(side="left")
         ttk.Entry(toolbar, textvariable=self.server_url_var, width=28).pack(side="left", padx=8)
         ttk.Button(toolbar, text="刷新图表", command=self.refresh_profit_chart).pack(side="left")
@@ -284,14 +298,26 @@ class PortfolioApp(tk.Tk):
             side="left", padx=8
         )
 
+        chart_body = ttk.Frame(self.profit_chart_tab)
+        chart_body.pack(fill="both", expand=True)
+
+        self.chart_symbol_panel = ttk.LabelFrame(chart_body, text="展示曲线", padding=(8, 6))
+        self.chart_symbol_panel.pack(side="right", fill="y", padx=(8, 0))
+        self.chart_symbol_panel.pack_propagate(False)
+        self.chart_symbol_panel.configure(width=150)
+        self.chart_symbol_list_frame = ttk.Frame(self.chart_symbol_panel)
+        self.chart_symbol_list_frame.pack(fill="both", expand=True)
+
         self.profit_chart_canvas = tk.Canvas(
-            self.profit_chart_tab,
+            chart_body,
             background="white",
             highlightthickness=1,
             highlightbackground="#d0d0d0",
         )
-        self.profit_chart_canvas.pack(fill="both", expand=True)
+        self.profit_chart_canvas.pack(side="left", fill="both", expand=True)
         self.profit_chart_canvas.bind("<Configure>", lambda _event: self.draw_profit_chart())
+        self.profit_chart_canvas.bind("<Motion>", self.on_profit_chart_motion)
+        self.profit_chart_canvas.bind("<Leave>", lambda _event: self.clear_chart_hover())
 
     def refresh_all(self):
         self.manager.data = self.manager.load_data()
@@ -512,7 +538,7 @@ class PortfolioApp(tk.Tk):
         self.apply_profit_chart_data(self.build_profit_chart_data())
 
     def apply_profit_chart_data(self, data):
-        self.profit_chart_data = data
+        self.profit_chart_data = self.filter_profit_chart_data(data)
         if self.highlighted_symbol not in self.profit_chart_data["series"]:
             self.highlighted_symbol = None
         self.draw_profit_chart()
@@ -521,12 +547,25 @@ class PortfolioApp(tk.Tk):
         snapshots = list(reversed(self.manager.list_holdings_snapshots()))
         metric = self.chart_metric_var.get()
         value_index = 6 if metric == "收益率" else 5
+        range_start = self.get_chart_range_start()
         labels = []
         series = {}
 
         for _path, snapshot in snapshots:
             saved_at = snapshot.get("saved_at", "未知")
+            if not self.is_chart_time_in_range(saved_at, range_start):
+                continue
+
+            point_index = len(labels)
             labels.append(saved_at)
+
+            total_value = (
+                snapshot.get("total_profit_rate", 0.0)
+                if metric == "收益率"
+                else snapshot.get("total_profit", 0.0)
+            )
+            series.setdefault("总收益", []).append((point_index, float(total_value)))
+
             for row in snapshot.get("rows", []):
                 if len(row) <= value_index:
                     continue
@@ -535,15 +574,17 @@ class PortfolioApp(tk.Tk):
                     value = self.parse_metric_value(row[value_index])
                 except ValueError:
                     continue
-                series.setdefault(symbol, []).append((len(labels) - 1, value))
+                series.setdefault(symbol, []).append((point_index, value))
 
+        all_series = {
+            symbol: points
+            for symbol, points in sorted(series.items(), key=self.chart_symbol_sort_key)
+            if points
+        }
         return {
             "labels": labels,
-            "series": {
-                symbol: points
-                for symbol, points in sorted(series.items())
-                if points
-            },
+            "series": all_series,
+            "all_series": all_series,
             "metric": metric,
             "source": "snapshots",
         }
@@ -566,6 +607,13 @@ class PortfolioApp(tk.Tk):
             "symbols": ",".join(sorted(holdings.keys())),
             "limit": "5000",
         })
+        range_start = self.get_chart_range_start()
+        if range_start:
+            query = urlencode({
+                "symbols": ",".join(sorted(holdings.keys())),
+                "limit": "5000",
+                "start": range_start.strftime("%Y-%m-%d %H:%M:%S"),
+            })
         response = requests.get(
             f"{server_url}/api/prices/history?{query}",
             timeout=10,
@@ -577,8 +625,13 @@ class PortfolioApp(tk.Tk):
         series = {}
         for point in payload.get("points", []):
             prices = point.get("prices", {})
-            labels.append(point.get("timestamp", "未知"))
-            point_index = len(labels) - 1
+            timestamp = point.get("timestamp", "未知")
+            if not self.is_chart_time_in_range(timestamp, range_start):
+                continue
+
+            point_values = {}
+            total_profit = 0.0
+            total_cost = 0.0
 
             for symbol, asset in holdings.items():
                 price = prices.get(symbol)
@@ -590,18 +643,198 @@ class PortfolioApp(tk.Tk):
                     value = profit / asset["total_cost"] * 100
                 else:
                     value = profit
+                point_values[symbol] = value
+                total_profit += profit
+                total_cost += asset["total_cost"]
+
+            if not point_values:
+                continue
+
+            point_index = len(labels)
+            labels.append(timestamp)
+            if metric == "收益率":
+                total_value = total_profit / total_cost * 100 if total_cost > 0 else 0.0
+            else:
+                total_value = total_profit
+            series.setdefault("总收益", []).append((point_index, total_value))
+            for symbol, value in point_values.items():
                 series.setdefault(symbol, []).append((point_index, value))
 
+        all_series = {
+            symbol: points
+            for symbol, points in sorted(series.items(), key=self.chart_symbol_sort_key)
+            if points
+        }
         return {
             "labels": labels,
-            "series": {
-                symbol: points
-                for symbol, points in sorted(series.items())
-                if points
-            },
+            "series": all_series,
+            "all_series": all_series,
             "metric": metric,
             "source": "server",
         }
+
+    def chart_symbol_sort_key(self, item):
+        symbol = item[0] if isinstance(item, tuple) else item
+        if symbol == "总收益":
+            return (0, symbol)
+        return (1, symbol)
+
+    def filter_profit_chart_data(self, data):
+        all_series = data.get("all_series", data.get("series", {}))
+        available_symbols = list(all_series.keys())
+        self.update_chart_symbol_selector(available_symbols)
+
+        selected_symbols = self.get_selected_chart_symbols(available_symbols)
+        filtered_series = {
+            symbol: points
+            for symbol, points in all_series.items()
+            if symbol in selected_symbols
+        }
+
+        filtered_data = data.copy()
+        filtered_data["all_series"] = all_series
+        filtered_data["series"] = filtered_series
+        return filtered_data
+
+    def chart_color_palette(self):
+        return [
+            "#c62828",
+            "#1565c0",
+            "#2e7d32",
+            "#6a1b9a",
+            "#ef6c00",
+            "#00838f",
+            "#ad1457",
+            "#455a64",
+            "#7b1fa2",
+            "#5d4037",
+        ]
+
+    def get_chart_color_map(self, symbols):
+        palette = self.chart_color_palette()
+        sorted_symbols = sorted(symbols, key=self.chart_symbol_sort_key)
+        return {
+            symbol: palette[index % len(palette)]
+            for index, symbol in enumerate(sorted_symbols)
+        }
+
+    def update_chart_symbol_selector(self, available_symbols):
+        available_symbols = sorted(available_symbols, key=self.chart_symbol_sort_key)
+        if not hasattr(self, "chart_symbol_list_frame"):
+            return
+
+        for child in self.chart_symbol_list_frame.winfo_children():
+            child.destroy()
+
+        if not available_symbols:
+            ttk.Label(self.chart_symbol_list_frame, text="暂无曲线").pack(anchor="w")
+            return
+
+        existing_symbols = set(self.chart_symbol_vars)
+        for symbol in list(existing_symbols - set(available_symbols)):
+            del self.chart_symbol_vars[symbol]
+
+        has_existing_selection = any(var.get() for var in self.chart_symbol_vars.values())
+        for symbol in available_symbols:
+            if symbol not in self.chart_symbol_vars:
+                default_selected = symbol == "总收益" and not has_existing_selection
+                self.chart_symbol_vars[symbol] = tk.BooleanVar(value=default_selected)
+
+        if not any(self.chart_symbol_vars[symbol].get() for symbol in available_symbols):
+            default_symbol = "总收益" if "总收益" in available_symbols else available_symbols[0]
+            self.chart_symbol_vars[default_symbol].set(True)
+
+        color_map = self.get_chart_color_map(available_symbols)
+        for symbol in available_symbols:
+            row = ttk.Frame(self.chart_symbol_list_frame)
+            row.pack(fill="x", pady=2)
+
+            swatch = tk.Label(
+                row,
+                text="■",
+                fg=color_map.get(symbol, "#333333"),
+                width=2,
+                cursor="hand2",
+            )
+            swatch.pack(side="left")
+            swatch.bind("<Button-1>", lambda _event, sym=symbol: self.toggle_chart_highlight(sym))
+
+            label = f"{symbol} 选中" if self.highlighted_symbol == symbol else symbol
+            checkbutton = ttk.Checkbutton(
+                row,
+                text=label,
+                variable=self.chart_symbol_vars[symbol],
+                command=self.on_chart_symbol_selection_changed,
+            )
+            checkbutton.pack(side="left", fill="x", expand=True)
+
+    def get_selected_chart_symbols(self, available_symbols):
+        selected = [
+            symbol for symbol in available_symbols
+            if self.chart_symbol_vars.get(symbol) and self.chart_symbol_vars[symbol].get()
+        ]
+        if selected:
+            return set(selected)
+
+        if "总收益" in available_symbols:
+            self.chart_symbol_vars["总收益"].set(True)
+            return {"总收益"}
+        if available_symbols:
+            self.chart_symbol_vars[available_symbols[0]].set(True)
+            return {available_symbols[0]}
+        return set()
+
+    def on_chart_symbol_selection_changed(self):
+        available_symbols = [
+            symbol for symbol, var in self.chart_symbol_vars.items()
+            if var is not None
+        ]
+        self.get_selected_chart_symbols(available_symbols)
+        if self.profit_chart_data:
+            self.profit_chart_data = self.filter_profit_chart_data(self.profit_chart_data)
+            if self.highlighted_symbol not in self.profit_chart_data["series"]:
+                self.highlighted_symbol = None
+            self.draw_profit_chart()
+        else:
+            self.refresh_profit_chart()
+
+    def get_chart_range_start(self):
+        range_label = self.chart_range_var.get()
+        now = datetime.now()
+        ranges = {
+            "过去一天": timedelta(days=1),
+            "过去一周": timedelta(weeks=1),
+            "过去一个月": timedelta(days=30),
+            "过去半年": timedelta(days=183),
+            "过去一年": timedelta(days=365),
+        }
+        delta = ranges.get(range_label)
+        if delta is None:
+            return None
+        return now - delta
+
+    def parse_chart_time(self, value):
+        text = str(value).strip()
+        formats = (
+            "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%d %H:%M",
+            "%Y-%m-%d",
+            "%Y-%m-%dT%H:%M:%S",
+        )
+        for fmt in formats:
+            try:
+                return datetime.strptime(text, fmt)
+            except ValueError:
+                pass
+        return None
+
+    def is_chart_time_in_range(self, value, range_start):
+        if range_start is None:
+            return True
+        parsed = self.parse_chart_time(value)
+        if parsed is None:
+            return True
+        return parsed >= range_start
 
     def draw_profit_chart(self):
         if not hasattr(self, "profit_chart_canvas"):
@@ -609,6 +842,7 @@ class PortfolioApp(tk.Tk):
 
         canvas = self.profit_chart_canvas
         canvas.delete("all")
+        self.profit_chart_layout = None
 
         data = self.profit_chart_data or self.build_profit_chart_data()
         labels = data["labels"]
@@ -631,8 +865,8 @@ class PortfolioApp(tk.Tk):
             )
             return
 
-        left = 74
-        right = 190
+        left = 48
+        right = 48
         top = 42
         bottom = 76
         chart_left = left
@@ -669,8 +903,6 @@ class PortfolioApp(tk.Tk):
             value = min_value + (max_value - min_value) * step / 5
             y = y_for(value)
             canvas.create_line(chart_left, y, chart_right, y, fill="#eeeeee")
-            label = f"{value:.1f}%" if metric == "收益率" else f"{value:.2f}"
-            canvas.create_text(chart_left - 10, y, text=label, anchor="e", fill="#555555")
 
         canvas.create_text(
             chart_left,
@@ -703,30 +935,35 @@ class PortfolioApp(tk.Tk):
             y_zero = y_for(0)
             canvas.create_line(chart_left, y_zero, chart_right, y_zero, fill="#999999", dash=(4, 3))
 
-        colors = [
-            "#c62828",
-            "#1565c0",
-            "#2e7d32",
-            "#6a1b9a",
-            "#ef6c00",
-            "#00838f",
-            "#ad1457",
-            "#455a64",
-            "#7b1fa2",
-            "#5d4037",
-        ]
+        color_map = self.get_chart_color_map(data.get("all_series", series).keys())
 
-        for color_index, (symbol, points) in enumerate(series.items()):
+        points_by_index = {index: [] for index in range(len(labels))}
+        for symbol, points in series.items():
             selected = self.highlighted_symbol == symbol
             dimmed = self.highlighted_symbol is not None and not selected
-            color = "#cfcfcf" if dimmed else colors[color_index % len(colors)]
+            base_color = color_map.get(symbol, "#333333")
+            color = "#cfcfcf" if dimmed else base_color
             line_width = 4 if selected else 2
             marker_radius = 5 if selected else 3
             coords = []
+            screen_points = []
             for index, value in points:
                 x = x_for(index)
                 y = y_for(value)
                 coords.extend((x, y))
+                screen_points.append({
+                    "index": index,
+                    "value": value,
+                    "x": x,
+                    "y": y,
+                })
+                points_by_index.setdefault(index, []).append({
+                    "symbol": symbol,
+                    "value": value,
+                    "x": x,
+                    "y": y,
+                    "color": base_color,
+                })
                 canvas.create_oval(
                     x - marker_radius,
                     y - marker_radius,
@@ -737,52 +974,203 @@ class PortfolioApp(tk.Tk):
                 )
             if len(coords) >= 4:
                 canvas.create_line(*coords, fill=color, width=line_width)
+            self.draw_chart_extreme_labels(canvas, symbol, screen_points, color, metric, chart_right)
 
-            legend_y = chart_top + color_index * 22
-            legend_x = chart_right + 24
-            tag = f"legend_{symbol}"
-            canvas.create_line(
-                legend_x,
-                legend_y,
-                legend_x + 22,
-                legend_y,
+        self.profit_chart_layout = {
+            "chart_left": chart_left,
+            "chart_right": chart_right,
+            "chart_top": chart_top,
+            "chart_bottom": chart_bottom,
+            "width": width,
+            "height": height,
+            "labels": labels,
+            "metric": metric,
+            "x_positions": [x_for(index) for index in range(len(labels))],
+            "points_by_index": points_by_index,
+        }
+
+    def draw_chart_extreme_labels(self, canvas, symbol, screen_points, color, metric, chart_right):
+        if not screen_points:
+            return
+
+        max_point = max(screen_points, key=lambda point: point["value"])
+        min_point = min(screen_points, key=lambda point: point["value"])
+        if max_point["index"] == min_point["index"] and max_point["value"] == min_point["value"]:
+            labels = [("最高/最低", max_point)]
+        else:
+            labels = [("最高", max_point), ("最低", min_point)]
+
+        for label_kind, point in labels:
+            label = (
+                f"{symbol} {label_kind} "
+                f"{self.format_chart_hover_value(point['value'], metric)}"
+            )
+            anchor = "w"
+            text_x = point["x"] + 8
+            if text_x > chart_right - 120:
+                anchor = "e"
+                text_x = point["x"] - 8
+
+            canvas.create_text(
+                text_x,
+                point["y"],
+                text=label,
+                anchor=anchor,
                 fill=color,
-                width=4 if selected else 3,
-                tags=(tag, "legend_item"),
+                font=("Microsoft YaHei UI", 8, "bold"),
             )
-            text_item = canvas.create_text(
-                legend_x + 30,
-                legend_y,
-                text=f"{symbol} 选中" if selected else symbol,
-                anchor="w",
-                fill="#111111" if selected else "#333333",
+
+    def on_profit_chart_motion(self, event):
+        layout = self.profit_chart_layout
+        if not layout:
+            return
+
+        if event.x < layout["chart_left"] or event.x > layout["chart_right"]:
+            self.clear_chart_hover()
+            return
+
+        x_positions = layout["x_positions"]
+        if not x_positions:
+            self.clear_chart_hover()
+            return
+
+        nearest_index = min(
+            range(len(x_positions)),
+            key=lambda index: abs(x_positions[index] - event.x),
+        )
+        points = layout["points_by_index"].get(nearest_index, [])
+        if not points:
+            self.clear_chart_hover()
+            return
+
+        self.draw_chart_hover(nearest_index, event.x, event.y)
+
+    def draw_chart_hover(self, index, mouse_x, mouse_y):
+        canvas = self.profit_chart_canvas
+        layout = self.profit_chart_layout
+        canvas.delete("chart_hover")
+
+        x = layout["x_positions"][index]
+        points = list(layout["points_by_index"].get(index, []))
+        if not points:
+            return
+
+        points.sort(key=self.chart_hover_sort_key)
+        metric = layout["metric"]
+        rows = [
+            f"{point['symbol']}: {self.format_chart_hover_value(point['value'], metric)}"
+            for point in points
+        ]
+        title = layout["labels"][index]
+
+        line_height = 20
+        padding_x = 10
+        padding_y = 8
+        box_width = max([len(title) * 8] + [len(row) * 8 for row in rows]) + padding_x * 2
+        box_height = padding_y * 2 + line_height * (len(rows) + 1)
+
+        box_x = mouse_x + 16
+        if box_x + box_width > layout["width"] - 8:
+            box_x = mouse_x - box_width - 16
+        box_x = max(8, min(box_x, layout["width"] - box_width - 8))
+
+        box_y = mouse_y + 16
+        if box_y + box_height > layout["height"] - 8:
+            box_y = mouse_y - box_height - 16
+        box_y = max(8, min(box_y, layout["height"] - box_height - 8))
+
+        canvas.create_line(
+            x,
+            layout["chart_top"],
+            x,
+            layout["chart_bottom"],
+            fill="#777777",
+            dash=(4, 3),
+            tags=("chart_hover",),
+        )
+        canvas.create_rectangle(
+            box_x + 3,
+            box_y + 3,
+            box_x + box_width + 3,
+            box_y + box_height + 3,
+            fill="#d7d7d7",
+            outline="",
+            tags=("chart_hover",),
+        )
+        canvas.create_rectangle(
+            box_x,
+            box_y,
+            box_x + box_width,
+            box_y + box_height,
+            fill="#ffffff",
+            outline="#888888",
+            tags=("chart_hover",),
+        )
+        canvas.create_text(
+            box_x + padding_x,
+            box_y + padding_y,
+            text=title,
+            anchor="nw",
+            fill="#222222",
+            font=("Microsoft YaHei UI", 9, "bold"),
+            tags=("chart_hover",),
+        )
+
+        for row_index, point in enumerate(points, start=1):
+            y = box_y + padding_y + line_height * row_index
+            selected = self.highlighted_symbol == point["symbol"]
+            canvas.create_text(
+                box_x + padding_x,
+                y,
+                text=f"{point['symbol']}: {self.format_chart_hover_value(point['value'], metric)}",
+                anchor="nw",
+                fill=point["color"],
                 font=("Microsoft YaHei UI", 9, "bold") if selected else ("Microsoft YaHei UI", 9),
-                tags=(tag, "legend_item"),
+                tags=("chart_hover",),
             )
-            bbox = canvas.bbox(text_item)
-            if bbox:
-                canvas.create_rectangle(
-                    legend_x - 6,
-                    bbox[1] - 4,
-                    legend_x + 118,
-                    bbox[3] + 4,
-                    outline="#999999" if selected else "",
-                    fill="",
-                    tags=(tag, "legend_item"),
-                )
-            canvas.tag_bind(tag, "<Button-1>", lambda _event, sym=symbol: self.toggle_chart_highlight(sym))
-            canvas.tag_bind(tag, "<Enter>", lambda _event: canvas.configure(cursor="hand2"))
-            canvas.tag_bind(tag, "<Leave>", lambda _event: canvas.configure(cursor=""))
+            canvas.create_oval(
+                point["x"] - 5,
+                point["y"] - 5,
+                point["x"] + 5,
+                point["y"] + 5,
+                outline=point["color"],
+                width=2,
+                tags=("chart_hover",),
+            )
+
+    def chart_hover_sort_key(self, point):
+        if self.highlighted_symbol == point["symbol"]:
+            return (0, point["symbol"])
+        return (1, point["symbol"])
+
+    def format_chart_hover_value(self, value, metric):
+        if metric == "收益率":
+            return f"{value:.2f}%"
+        return f"{value:.2f}"
+
+    def clear_chart_hover(self):
+        if hasattr(self, "profit_chart_canvas"):
+            self.profit_chart_canvas.delete("chart_hover")
 
     def toggle_chart_highlight(self, symbol):
+        if symbol in self.chart_symbol_vars and not self.chart_symbol_vars[symbol].get():
+            self.chart_symbol_vars[symbol].set(True)
+
         if self.highlighted_symbol == symbol:
             self.highlighted_symbol = None
         else:
             self.highlighted_symbol = symbol
+
+        if self.profit_chart_data:
+            self.profit_chart_data = self.filter_profit_chart_data(self.profit_chart_data)
+            if self.highlighted_symbol not in self.profit_chart_data["series"]:
+                self.highlighted_symbol = None
         self.draw_profit_chart()
 
     def clear_chart_highlight(self):
         self.highlighted_symbol = None
+        if self.profit_chart_data:
+            self.profit_chart_data = self.filter_profit_chart_data(self.profit_chart_data)
         self.draw_profit_chart()
 
     def parse_trade_form(self):
