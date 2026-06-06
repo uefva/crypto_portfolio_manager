@@ -2,6 +2,7 @@ import configparser
 import json
 import sqlite3
 import threading
+from contextlib import closing
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
@@ -13,6 +14,7 @@ from crypto_portfolio.portfolio_manager import PortfolioManager
 
 
 DEFAULT_CONFIG_PATH = "server_config.ini"
+COLLECT_RETRY_COUNT = 3
 
 
 @dataclass
@@ -51,7 +53,7 @@ class PriceHistoryStore:
         return sqlite3.connect(self.database_path)
 
     def init_schema(self):
-        with self.connect() as conn:
+        with closing(self.connect()) as conn:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS price_history (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -66,6 +68,7 @@ class PriceHistoryStore:
                 CREATE INDEX IF NOT EXISTS idx_price_history_symbol_time
                 ON price_history(symbol, fetched_at)
             """)
+            conn.commit()
 
     def save_prices(self, prices, sources, fetched_at):
         if not prices:
@@ -75,11 +78,12 @@ class PriceHistoryStore:
             (symbol, float(price), sources.get(symbol, "unknown"), fetched_at)
             for symbol, price in prices.items()
         ]
-        with self.connect() as conn:
+        with closing(self.connect()) as conn:
             conn.executemany("""
                 INSERT OR REPLACE INTO price_history(symbol, price, source, fetched_at)
                 VALUES (?, ?, ?, ?)
             """, rows)
+            conn.commit()
         return len(rows)
 
     def latest_prices(self, symbols):
@@ -87,7 +91,7 @@ class PriceHistoryStore:
             return {}
 
         latest = {}
-        with self.connect() as conn:
+        with closing(self.connect()) as conn:
             conn.row_factory = sqlite3.Row
             for symbol in symbols:
                 row = conn.execute("""
@@ -129,7 +133,7 @@ class PriceHistoryStore:
         """
 
         points_by_time = {}
-        with self.connect() as conn:
+        with closing(self.connect()) as conn:
             conn.row_factory = sqlite3.Row
             for row in conn.execute(query, params):
                 point = points_by_time.setdefault(
@@ -149,15 +153,62 @@ class PriceCollector:
 
     def fetch_once(self):
         config = load_config(self.config_path)
+        expected_symbols = normalize_symbols(config.symbols)
+        if not expected_symbols:
+            return {
+                "status": "skipped",
+                "reason": "no_symbols",
+                "attempts": 0,
+                "fetched_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "saved_count": 0,
+                "missing_symbols": [],
+                "prices": {},
+                "sources": {},
+            }
+
+        last_prices = {}
+        last_sources = {}
+        last_missing_symbols = expected_symbols
+
+        for attempt in range(1, COLLECT_RETRY_COUNT + 1):
+            fetched_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            prices, sources = fetch_prices(expected_symbols)
+            missing_symbols = find_missing_symbols(expected_symbols, prices, sources)
+            last_prices = prices
+            last_sources = sources
+            last_missing_symbols = missing_symbols
+
+            if missing_symbols:
+                print(
+                    f"{fetched_at} 第 {attempt}/{COLLECT_RETRY_COUNT} 次采集不完整，"
+                    f"缺失: {', '.join(missing_symbols)}"
+                )
+                continue
+
+            # Only complete batches are written. Partial attempt data stays in
+            # local variables and is discarded if the retry budget is exhausted.
+            store = PriceHistoryStore(config.database)
+            saved_count = store.save_prices(prices, sources, fetched_at)
+            return {
+                "status": "saved",
+                "attempts": attempt,
+                "fetched_at": fetched_at,
+                "saved_count": saved_count,
+                "missing_symbols": [],
+                "prices": prices,
+                "sources": sources,
+            }
+
         fetched_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        prices, sources = fetch_prices(config.symbols)
-        store = PriceHistoryStore(config.database)
-        saved_count = store.save_prices(prices, sources, fetched_at)
         return {
+            "status": "skipped",
+            "reason": "incomplete_prices",
+            "attempts": COLLECT_RETRY_COUNT,
             "fetched_at": fetched_at,
-            "saved_count": saved_count,
-            "prices": prices,
-            "sources": sources,
+            "saved_count": 0,
+            "missing_symbols": last_missing_symbols,
+            "prices": last_prices,
+            "sources": last_sources,
         }
 
     def start(self):
@@ -172,7 +223,15 @@ class PriceCollector:
         while not self.stop_event.is_set():
             try:
                 result = self.fetch_once()
-                print(f"{result['fetched_at']} 已保存 {result['saved_count']} 条价格。")
+                if result.get("status") == "saved":
+                    print(
+                        f"{result['fetched_at']} 已保存 {result['saved_count']} 条价格，"
+                        f"尝试 {result.get('attempts', 1)} 次。"
+                    )
+                else:
+                    missing = result.get("missing_symbols", [])
+                    missing_text = f"，缺失: {', '.join(missing)}" if missing else ""
+                    print(f"{result['fetched_at']} 本轮价格采集跳过{missing_text}。")
             except Exception as exc:
                 print(f"价格采集失败: {exc}")
 
@@ -181,8 +240,19 @@ class PriceCollector:
             self.stop_event.wait(interval_seconds)
 
 
+def normalize_symbols(symbols):
+    return [symbol.strip().upper() for symbol in symbols if symbol.strip()]
+
+
+def find_missing_symbols(expected_symbols, prices, sources):
+    return [
+        symbol for symbol in expected_symbols
+        if symbol not in prices or symbol not in sources
+    ]
+
+
 def fetch_prices(symbols):
-    symbols = [symbol.strip().upper() for symbol in symbols if symbol.strip()]
+    symbols = normalize_symbols(symbols)
     if not symbols:
         return {}, {}
 
