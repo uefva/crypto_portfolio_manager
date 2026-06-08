@@ -24,6 +24,7 @@ class ServerConfig:
     symbols: list[str]
     interval_minutes: int
     database: str
+    log_level: str
 
 
 def load_config(config_path=DEFAULT_CONFIG_PATH):
@@ -39,7 +40,19 @@ def load_config(config_path=DEFAULT_CONFIG_PATH):
         symbols=symbols,
         interval_minutes=parser.getint("prices", "interval_minutes", fallback=30),
         database=parser.get("prices", "database", fallback="price_history.sqlite3"),
+        log_level=parser.get("logging", "level", fallback="INFO").strip().upper(),
     )
+
+
+def should_log_response_payload(config):
+    levels = {
+        "TRACE": 5,
+        "DEBUG": 10,
+        "INFO": 20,
+        "WARNING": 30,
+        "ERROR": 40,
+    }
+    return levels.get(config.log_level, 20) <= levels["DEBUG"]
 
 
 class PriceHistoryStore:
@@ -366,6 +379,7 @@ def make_handler(config_path, collector):
             self.send_json({"error": "not found"}, status=404)
 
         def send_json(self, payload, status=200):
+            config = load_config(config_path)
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -373,6 +387,14 @@ def make_handler(config_path, collector):
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             self.wfile.write(body)
+            if should_log_response_payload(config):
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                client_ip = self.get_client_ip()
+                print(
+                    f"[{timestamp}] DEBUG response to {client_ip} "
+                    f"{self.path} status={status}: "
+                    f"{json.dumps(payload, ensure_ascii=False)}"
+                )
 
         def get_client_ip(self):
             for header in ("CF-Connecting-IP", "X-Real-IP", "X-Forwarded-For"):
@@ -403,6 +425,7 @@ def run_server(config_path=DEFAULT_CONFIG_PATH):
     )
     print(f"价格服务已启动: http://{config.host}:{config.port}")
     print(f"配置文件: {config_path}")
+    print(f"日志等级: {config.log_level}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
