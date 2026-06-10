@@ -1,65 +1,80 @@
 import json
-import requests
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
+
 from tabulate import tabulate
+
+from crypto_portfolio.market_data import (
+    CATEGORY_ALL,
+    CATEGORY_CRYPTO,
+    CATEGORY_FUND,
+    CATEGORY_STOCK,
+    CATEGORIES,
+    COIN_MAP,
+    MARKET_CRYPTO,
+    MARKET_FUND,
+    MARKET_LABELS,
+    asset_id_for,
+    asset_label,
+    currency_for,
+    fetch_asset_quote,
+    fetch_crypto_quote,
+    fetch_fx_to_cny,
+    fetch_quotes_for_assets,
+    normalize_category,
+    normalize_market,
+    normalize_symbol,
+)
+
 
 DATA_FILE = "portfolio.json"
 BACKUP_DIR = "portfolio_backups"
 MAX_BACKUPS = 100
 HOLDING_SNAPSHOT_DIR = "holding_snapshots"
+PORTFOLIO_VERSION = 2
 
-COIN_MAP = {
-    "BTC": "bitcoin",
-    "ETH": "ethereum",
-    "ADA": "cardano",
-    "SOL": "solana",
-    "SUI": "sui",
-    "PEPE": "pepe",
-    "DOGE": "dogecoin",
-}
 
-OKX_SYMBOL_MAP = {
-    "BTC": "BTC-USDT",
-    "ETH": "ETH-USDT",
-    "ADA": "ADA-USDT",
-    "SOL": "SOL-USDT",
-    "SUI": "SUI-USDT",
-    "PEPE": "PEPE-USDT",
-    "DOGE": "DOGE-USDT",
-}
-
-BINANCE_SYMBOL_MAP = {
-    "BTC": "BTCUSDT",
-    "ETH": "ETHUSDT",
-    "ADA": "ADAUSDT",
-    "SOL": "SOLUSDT",
-    "SUI": "SUIUSDT",
-    "PEPE": "PEPEUSDT",
-    "DOGE": "DOGEUSDT",
-}
-
-PRICE_TIMEOUT = 4
+def safe_float(value, default=0.0):
+    try:
+        if value in (None, "", "-", "--"):
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
 class PortfolioManager:
     def __init__(self):
+        self.migration_needed = False
         self.data = self.load_data()
+        if self.migration_needed:
+            self.save_data()
 
     def load_data(self):
         path = Path(DATA_FILE)
-        if path.exists():
-            with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
-        return {}
+        if not path.exists():
+            return {}
+
+        with open(path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+
+        if isinstance(raw, dict) and raw.get("version") == PORTFOLIO_VERSION:
+            assets = raw.get("assets", {})
+            return self.normalize_assets(assets)
+
+        self.migration_needed = True
+        return self.migrate_legacy_data(raw)
 
     def save_data(self):
+        payload = {
+            "version": PORTFOLIO_VERSION,
+            "assets": self.data,
+        }
         with open(DATA_FILE, "w", encoding="utf-8") as f:
-            json.dump(self.data, f, ensure_ascii=False, indent=2)
-        self.backup_data()
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        self.backup_data(payload)
 
-    def backup_data(self):
+    def backup_data(self, payload=None):
         data_path = Path(DATA_FILE)
         if not data_path.exists():
             return
@@ -70,11 +85,11 @@ class PortfolioManager:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         backup_path = backup_dir / f"{data_path.stem}_{timestamp}{data_path.suffix}"
         with open(backup_path, "w", encoding="utf-8") as f:
-            json.dump(self.data, f, ensure_ascii=False, indent=2)
+            json.dump(payload or {"version": PORTFOLIO_VERSION, "assets": self.data}, f, ensure_ascii=False, indent=2)
 
         backups = sorted(
             backup_dir.glob(f"{data_path.stem}_*{data_path.suffix}"),
-            key=lambda path: path.name
+            key=lambda path: path.name,
         )
         for old_backup in backups[:-MAX_BACKUPS]:
             old_backup.unlink()
@@ -90,7 +105,7 @@ class PortfolioManager:
         formats = [
             "%Y-%m-%d %H:%M:%S",
             "%Y-%m-%d %H:%M",
-            "%Y-%m-%d"
+            "%Y-%m-%d",
         ]
         for fmt in formats:
             try:
@@ -102,81 +117,280 @@ class PortfolioManager:
         print("日期格式无效，请使用 YYYY-MM-DD 或 YYYY-MM-DD HH:MM:SS。")
         return None
 
+    def migrate_legacy_data(self, raw):
+        if not isinstance(raw, dict):
+            return {}
+
+        fx_to_cny, fx_source, _estimated = fetch_fx_to_cny("USD")
+        assets = {}
+        for symbol, old_asset in raw.items():
+            if not isinstance(old_asset, dict):
+                continue
+
+            symbol = normalize_symbol(symbol, CATEGORY_CRYPTO, MARKET_CRYPTO)
+            asset_id = asset_id_for(CATEGORY_CRYPTO, MARKET_CRYPTO, symbol)
+            transactions = []
+            for tx in old_asset.get("transactions", []):
+                amount = safe_float(tx.get("amount"))
+                price = safe_float(tx.get("price"))
+                total = safe_float(tx.get("total"), amount * price) or amount * price
+                transactions.append({
+                    "type": str(tx.get("type", "")).strip().lower(),
+                    "date": tx.get("date", self.now()),
+                    "amount": amount,
+                    "price": price,
+                    "total": total,
+                    "currency": "USD",
+                    "fx_to_cny": fx_to_cny,
+                    "fx_source": fx_source,
+                    "fx_estimated": True,
+                    "migrated_fx": True,
+                    "total_cny": total * fx_to_cny,
+                })
+
+            asset = {
+                "asset_id": asset_id,
+                "category": CATEGORY_CRYPTO,
+                "market": MARKET_CRYPTO,
+                "symbol": symbol,
+                "name": symbol,
+                "currency": "USD",
+                "quantity": safe_float(old_asset.get("quantity")),
+                "total_cost": safe_float(old_asset.get("total_cost")),
+                "total_cost_cny": safe_float(old_asset.get("total_cost")) * fx_to_cny,
+                "transactions": transactions,
+            }
+            rebuilt = self.rebuild_asset(asset["transactions"])
+            if rebuilt is not None:
+                asset["quantity"], asset["total_cost"], asset["total_cost_cny"] = rebuilt
+            assets[asset_id] = asset
+
+        return assets
+
+    def normalize_assets(self, assets):
+        normalized = {}
+        if not isinstance(assets, dict):
+            return normalized
+
+        for key, asset in assets.items():
+            if not isinstance(asset, dict):
+                continue
+
+            category = normalize_category(asset.get("category", CATEGORY_CRYPTO))
+            market = normalize_market(asset.get("market"), category)
+            symbol = normalize_symbol(asset.get("symbol") or key, category, market)
+            asset_id = asset.get("asset_id") or asset_id_for(category, market, symbol)
+            currency = str(asset.get("currency") or currency_for(category, market)).upper()
+
+            transactions = [
+                self.normalize_transaction(tx, currency)
+                for tx in asset.get("transactions", [])
+                if isinstance(tx, dict)
+            ]
+            normalized_asset = {
+                "asset_id": asset_id,
+                "category": category,
+                "market": market,
+                "symbol": symbol,
+                "name": asset.get("name") or symbol,
+                "currency": currency,
+                "quantity": safe_float(asset.get("quantity")),
+                "total_cost": safe_float(asset.get("total_cost")),
+                "total_cost_cny": safe_float(asset.get("total_cost_cny")),
+                "transactions": transactions,
+            }
+
+            rebuilt = self.rebuild_asset(transactions)
+            if rebuilt is not None:
+                normalized_asset["quantity"], normalized_asset["total_cost"], normalized_asset["total_cost_cny"] = rebuilt
+            normalized[asset_id] = normalized_asset
+
+        return normalized
+
+    def normalize_transaction(self, tx, currency):
+        amount = safe_float(tx.get("amount"))
+        price = safe_float(tx.get("price"))
+        total = safe_float(tx.get("total"), amount * price) or amount * price
+        tx_currency = str(tx.get("currency") or currency).upper()
+        fx_to_cny = safe_float(tx.get("fx_to_cny"))
+        if fx_to_cny <= 0:
+            fx_to_cny, fx_source, fx_estimated = fetch_fx_to_cny(tx_currency)
+        else:
+            fx_source = tx.get("fx_source", "历史记录")
+            fx_estimated = bool(tx.get("fx_estimated", False))
+        return {
+            "type": str(tx.get("type", "")).strip().lower(),
+            "date": tx.get("date", self.now()),
+            "amount": amount,
+            "price": price,
+            "total": total,
+            "currency": tx_currency,
+            "fx_to_cny": fx_to_cny,
+            "fx_source": fx_source,
+            "fx_estimated": fx_estimated,
+            "migrated_fx": bool(tx.get("migrated_fx", False)),
+            "total_cny": safe_float(tx.get("total_cny"), total * fx_to_cny) or total * fx_to_cny,
+        }
+
     def validate_trade(self, symbol, amount, price):
-        symbol = symbol.upper().strip()
+        symbol = str(symbol or "").upper().strip()
         if not symbol:
-            print("币种不能为空。")
+            print("代码不能为空。")
             return None
         if amount <= 0 or price <= 0:
             print("数量和价格必须大于 0。")
             return None
         return symbol
 
-    def get_symbols(self):
-        return sorted(self.data.keys())
+    def resolve_fx(self, currency, fx_to_cny=None):
+        currency = str(currency or "CNY").upper()
+        if fx_to_cny not in (None, ""):
+            fx = safe_float(fx_to_cny)
+            if fx > 0:
+                return fx, "手动输入", False
+        fx, source, estimated = fetch_fx_to_cny(currency)
+        return fx, source, estimated
+
+    def build_asset(self, category, market, symbol, name=""):
+        category = normalize_category(category)
+        market = normalize_market(market, category)
+        symbol = normalize_symbol(symbol, category, market)
+        asset_id = asset_id_for(category, market, symbol)
+        currency = currency_for(category, market)
+        return {
+            "asset_id": asset_id,
+            "category": category,
+            "market": market,
+            "symbol": symbol,
+            "name": name.strip() if isinstance(name, str) and name.strip() else symbol,
+            "currency": currency,
+            "quantity": 0.0,
+            "total_cost": 0.0,
+            "total_cost_cny": 0.0,
+            "transactions": [],
+        }
+
+    def get_symbols(self, category=CATEGORY_CRYPTO):
+        category = normalize_category(category)
+        return sorted({
+            asset["symbol"]
+            for asset in self.data.values()
+            if asset.get("category") == category
+        })
+
+    def get_assets(self, category=CATEGORY_ALL, active_only=False):
+        category = normalize_category(category) if category != CATEGORY_ALL else CATEGORY_ALL
+        assets = []
+        for asset in self.data.values():
+            if category != CATEGORY_ALL and asset.get("category") != category:
+                continue
+            if active_only and asset.get("quantity", 0) <= 0:
+                continue
+            assets.append(asset)
+        return sorted(assets, key=lambda item: (item.get("category", ""), item.get("market", ""), item.get("symbol", "")))
+
+    def get_active_assets(self):
+        return self.get_assets(CATEGORY_ALL, active_only=True)
+
+    def find_asset_id(self, symbol, category=CATEGORY_CRYPTO, market=None):
+        category = normalize_category(category)
+        market = normalize_market(market, category)
+        symbol = normalize_symbol(symbol, category, market)
+        exact = asset_id_for(category, market, symbol)
+        if exact in self.data:
+            return exact
+
+        matches = [
+            asset_id for asset_id, asset in self.data.items()
+            if asset.get("symbol") == symbol and asset.get("category") == category
+        ]
+        if len(matches) == 1:
+            return matches[0]
+        return exact
 
     def get_buy_transactions(self, symbol):
-        symbol = symbol.upper().strip()
-        if symbol not in self.data:
+        asset_id = self.find_asset_id(symbol, CATEGORY_CRYPTO, MARKET_CRYPTO)
+        if asset_id not in self.data:
             return []
 
         buys = []
-        for index, tx in enumerate(self.data[symbol].get("transactions", [])):
+        for index, tx in enumerate(self.data[asset_id].get("transactions", [])):
             if tx.get("type") == "buy":
                 buys.append((index, tx))
         return buys
 
-    def get_transactions(self, symbol=""):
-        symbol = symbol.upper().strip()
-        if symbol and symbol not in self.data:
-            return []
-
-        assets = {symbol: self.data[symbol]} if symbol else self.data
+    def get_transactions(self, category=CATEGORY_ALL, asset_id=None, symbol=""):
         transactions = []
-        for sym, asset in assets.items():
+        if symbol or (category not in (CATEGORY_ALL, *CATEGORIES) and asset_id is None):
+            legacy_symbol = symbol or category
+            asset_id = self.find_asset_id(legacy_symbol, CATEGORY_CRYPTO, MARKET_CRYPTO)
+            category = CATEGORY_ALL
+
+        assets = self.data.values()
+        if asset_id:
+            assets = [self.data[asset_id]] if asset_id in self.data else []
+        elif category != CATEGORY_ALL:
+            assets = self.get_assets(category)
+
+        for asset in assets:
             for index, tx in enumerate(asset.get("transactions", [])):
                 transactions.append({
-                    "symbol": sym,
+                    "asset_id": asset["asset_id"],
+                    "category": asset.get("category", ""),
+                    "market": asset.get("market", ""),
+                    "market_label": MARKET_LABELS.get(asset.get("market", ""), asset.get("market", "")),
+                    "symbol": asset.get("symbol", ""),
+                    "name": asset.get("name", ""),
+                    "currency": asset.get("currency", ""),
                     "index": index,
                     "type": tx.get("type", ""),
                     "date": tx.get("date", ""),
                     "amount": tx.get("amount", 0),
                     "price": tx.get("price", 0),
                     "total": tx.get("total", 0),
+                    "fx_to_cny": tx.get("fx_to_cny", 1),
+                    "total_cny": tx.get("total_cny", 0),
                 })
 
         return sorted(transactions, key=lambda item: item["date"])
 
-    def update_transaction(self, symbol, transaction_index, tx_type, amount, price, trade_date):
-        symbol = symbol.upper().strip()
+    def update_transaction_by_asset(self, asset_id, transaction_index, tx_type, amount, price, trade_date, fx_to_cny=None):
+        if asset_id not in self.data:
+            print("未找到该资产。")
+            return False
+
+        asset = self.data[asset_id]
         tx_type = tx_type.strip().lower()
         if tx_type not in {"buy", "sell"}:
             print("交易类型必须是 buy 或 sell。")
             return False
 
-        if self.validate_trade(symbol, amount, price) is None:
+        if self.validate_trade(asset["symbol"], amount, price) is None:
             return False
 
         trade_date = self.normalize_trade_date(trade_date)
         if trade_date is None:
             return False
 
-        if symbol not in self.data:
-            print("未找到该币种。")
-            return False
-
-        transactions = self.data[symbol].get("transactions", [])
+        transactions = asset.get("transactions", [])
         if transaction_index < 0 or transaction_index >= len(transactions):
             print("未找到该交易记录。")
             return False
 
+        fx, fx_source, fx_estimated = self.resolve_fx(asset["currency"], fx_to_cny)
+        total = amount * price
         new_transactions = [item.copy() for item in transactions]
         new_transactions[transaction_index] = {
             "type": tx_type,
             "date": trade_date,
             "amount": amount,
             "price": price,
-            "total": amount * price
+            "total": total,
+            "currency": asset["currency"],
+            "fx_to_cny": fx,
+            "fx_source": fx_source,
+            "fx_estimated": fx_estimated,
+            "total_cny": total * fx,
         }
 
         rebuilt = self.rebuild_asset(new_transactions)
@@ -184,21 +398,23 @@ class PortfolioManager:
             print("修改失败：修改后账单会导致卖出数量超过持仓，原有账单未改变。")
             return False
 
-        quantity, total_cost = rebuilt
-        self.data[symbol]["transactions"] = new_transactions
-        self.data[symbol]["quantity"] = quantity
-        self.data[symbol]["total_cost"] = total_cost
+        asset["transactions"] = new_transactions
+        asset["quantity"], asset["total_cost"], asset["total_cost_cny"] = rebuilt
         self.save_data()
         print("交易记录已更新。")
         return True
 
-    def delete_transaction(self, symbol, transaction_index):
-        symbol = symbol.upper().strip()
-        if symbol not in self.data:
-            print("未找到该币种。")
+    def update_transaction(self, symbol, transaction_index, tx_type, amount, price, trade_date):
+        asset_id = self.find_asset_id(symbol, CATEGORY_CRYPTO, MARKET_CRYPTO)
+        return self.update_transaction_by_asset(asset_id, transaction_index, tx_type, amount, price, trade_date)
+
+    def delete_transaction_by_asset(self, asset_id, transaction_index):
+        if asset_id not in self.data:
+            print("未找到该资产。")
             return False
 
-        transactions = self.data[symbol].get("transactions", [])
+        asset = self.data[asset_id]
+        transactions = asset.get("transactions", [])
         if transaction_index < 0 or transaction_index >= len(transactions):
             print("未找到该交易记录。")
             return False
@@ -212,109 +428,111 @@ class PortfolioManager:
             print("删除失败：删除后账单会导致卖出数量超过持仓，原有账单未改变。")
             return False
 
-        quantity, total_cost = rebuilt
         if not new_transactions:
-            del self.data[symbol]
+            del self.data[asset_id]
         else:
-            self.data[symbol]["transactions"] = new_transactions
-            self.data[symbol]["quantity"] = quantity
-            self.data[symbol]["total_cost"] = total_cost
+            asset["transactions"] = new_transactions
+            asset["quantity"], asset["total_cost"], asset["total_cost_cny"] = rebuilt
 
         self.save_data()
         print("交易记录已删除。")
         return True
 
-    def buy(self, symbol, amount, price, trade_date=None):
+    def delete_transaction(self, symbol, transaction_index):
+        asset_id = self.find_asset_id(symbol, CATEGORY_CRYPTO, MARKET_CRYPTO)
+        return self.delete_transaction_by_asset(asset_id, transaction_index)
+
+    def buy_asset(self, category, market, symbol, amount, price, trade_date=None, name="", fx_to_cny=None):
         symbol = self.validate_trade(symbol, amount, price)
         if symbol is None:
             return False
 
+        category = normalize_category(category)
+        market = normalize_market(market, category)
+        symbol = normalize_symbol(symbol, category, market)
         trade_date = self.normalize_trade_date(trade_date)
         if trade_date is None:
             return False
 
+        asset_id = asset_id_for(category, market, symbol)
+        if asset_id not in self.data:
+            self.data[asset_id] = self.build_asset(category, market, symbol, name)
+        elif name and name.strip():
+            self.data[asset_id]["name"] = name.strip()
+
+        asset = self.data[asset_id]
+        fx, fx_source, fx_estimated = self.resolve_fx(asset["currency"], fx_to_cny)
         total = amount * price
+        total_cny = total * fx
 
-        if symbol not in self.data:
-            self.data[symbol] = {
-                "quantity": 0.0,
-                "total_cost": 0.0,
-                "transactions": []
-            }
-
-        asset = self.data[symbol]
         asset["quantity"] += amount
         asset["total_cost"] += total
-
+        asset["total_cost_cny"] += total_cny
         asset["transactions"].append({
             "type": "buy",
             "date": trade_date,
             "amount": amount,
             "price": price,
-            "total": total
+            "total": total,
+            "currency": asset["currency"],
+            "fx_to_cny": fx,
+            "fx_source": fx_source,
+            "fx_estimated": fx_estimated,
+            "total_cny": total_cny,
         })
 
         self.save_data()
         print("买入记录已保存。")
         return True
 
+    def buy(self, symbol, amount, price, trade_date=None):
+        return self.buy_asset(CATEGORY_CRYPTO, MARKET_CRYPTO, symbol, amount, price, trade_date)
+
     def delete_buy_order(self, symbol, transaction_index):
-        symbol = symbol.upper().strip()
-        if symbol not in self.data:
+        asset_id = self.find_asset_id(symbol, CATEGORY_CRYPTO, MARKET_CRYPTO)
+        if asset_id not in self.data:
             print("未找到该币种。")
             return False
 
-        transactions = self.data[symbol].get("transactions", [])
+        transactions = self.data[asset_id].get("transactions", [])
         if transaction_index < 0 or transaction_index >= len(transactions):
             print("未找到该买入订单。")
             return False
 
-        tx = transactions[transaction_index]
-        if tx.get("type") != "buy":
+        if transactions[transaction_index].get("type") != "buy":
             print("只能删除买入订单。")
             return False
 
-        new_transactions = [
-            item for index, item in enumerate(transactions)
-            if index != transaction_index
-        ]
-        rebuilt = self.rebuild_asset(new_transactions)
-        if rebuilt is None:
-            print("删除失败：删除该买入订单后，后续卖出数量会超过持仓。原有账单未改变。")
-            return False
-
-        quantity, total_cost = rebuilt
-        if not new_transactions:
-            del self.data[symbol]
-        else:
-            self.data[symbol]["transactions"] = new_transactions
-            self.data[symbol]["quantity"] = quantity
-            self.data[symbol]["total_cost"] = total_cost
-
-        self.save_data()
-        print("买入订单已删除。")
-        return True
+        return self.delete_transaction_by_asset(asset_id, transaction_index)
 
     def rebuild_asset(self, transactions):
         quantity = 0.0
         total_cost = 0.0
+        total_cost_cny = 0.0
 
         for tx in transactions:
-            amount = tx.get("amount", 0)
-            price = tx.get("price", 0)
-            if amount <= 0 or price <= 0:
-                print("账单中存在无效数量或价格，无法重算持仓。")
+            amount = safe_float(tx.get("amount"))
+            price = safe_float(tx.get("price"))
+            fx_to_cny = safe_float(tx.get("fx_to_cny"), 1.0)
+            if amount <= 0 or price <= 0 or fx_to_cny <= 0:
+                print("账单中存在无效数量、价格或汇率，无法重算持仓。")
                 return None
+
+            total = safe_float(tx.get("total"), amount * price) or amount * price
+            total_cny = safe_float(tx.get("total_cny"), total * fx_to_cny) or total * fx_to_cny
 
             if tx.get("type") == "buy":
                 quantity += amount
-                total_cost += amount * price
+                total_cost += total
+                total_cost_cny += total_cny
             elif tx.get("type") == "sell":
                 if amount > quantity + 1e-12:
                     return None
                 avg_cost = total_cost / quantity if quantity > 0 else 0.0
+                avg_cost_cny = total_cost_cny / quantity if quantity > 0 else 0.0
                 quantity -= amount
                 total_cost -= avg_cost * amount
+                total_cost_cny -= avg_cost_cny * amount
             else:
                 print("账单中存在未知交易类型，无法重算持仓。")
                 return None
@@ -322,208 +540,200 @@ class PortfolioManager:
             if abs(quantity) < 1e-12:
                 quantity = 0.0
                 total_cost = 0.0
+                total_cost_cny = 0.0
 
-        return quantity, total_cost
+        return quantity, total_cost, total_cost_cny
 
-    def sell(self, symbol, amount, price, trade_date=None):
-        symbol = self.validate_trade(symbol, amount, price)
-        if symbol is None:
+    def sell_asset(self, asset_id, amount, price, trade_date=None, fx_to_cny=None):
+        if asset_id not in self.data:
+            print("没有该资产持仓。")
+            return False
+
+        asset = self.data[asset_id]
+        if self.validate_trade(asset["symbol"], amount, price) is None:
             return False
 
         trade_date = self.normalize_trade_date(trade_date)
         if trade_date is None:
             return False
 
-        if symbol not in self.data:
-            print("没有该币种持仓。")
-            return False
-
-        asset = self.data[symbol]
-
-        if amount > asset["quantity"]:
+        if amount > asset["quantity"] + 1e-12:
             print("卖出数量超过持仓。")
             return False
 
+        fx, fx_source, fx_estimated = self.resolve_fx(asset["currency"], fx_to_cny)
         avg_cost = asset["total_cost"] / asset["quantity"] if asset["quantity"] > 0 else 0
-        cost_reduction = avg_cost * amount
+        avg_cost_cny = asset["total_cost_cny"] / asset["quantity"] if asset["quantity"] > 0 else 0
         total = amount * price
+        total_cny = total * fx
 
         asset["quantity"] -= amount
-        asset["total_cost"] -= cost_reduction
-
+        asset["total_cost"] -= avg_cost * amount
+        asset["total_cost_cny"] -= avg_cost_cny * amount
         asset["transactions"].append({
             "type": "sell",
             "date": trade_date,
             "amount": amount,
             "price": price,
-            "total": total
+            "total": total,
+            "currency": asset["currency"],
+            "fx_to_cny": fx,
+            "fx_source": fx_source,
+            "fx_estimated": fx_estimated,
+            "total_cny": total_cny,
         })
 
         if abs(asset["quantity"]) < 1e-12:
             asset["quantity"] = 0.0
             asset["total_cost"] = 0.0
+            asset["total_cost_cny"] = 0.0
 
         self.save_data()
         print("卖出记录已保存。")
         return True
 
+    def sell(self, symbol, amount, price, trade_date=None):
+        asset_id = self.find_asset_id(symbol, CATEGORY_CRYPTO, MARKET_CRYPTO)
+        return self.sell_asset(asset_id, amount, price, trade_date)
+
+    def get_latest_quotes(self, assets=None):
+        assets = assets if assets is not None else self.get_active_assets()
+        quotes, errors = fetch_quotes_for_assets(assets)
+        for asset in assets:
+            quote = quotes.get(asset["asset_id"])
+            if quote and quote.get("name") and asset.get("name") in ("", asset.get("symbol")):
+                asset["name"] = quote["name"]
+        for asset_id, error in errors.items():
+            asset = self.data.get(asset_id)
+            label = asset_label(asset) if asset else asset_id
+            print(f"{label} 价格获取失败: {error}")
+        return quotes
+
     def get_prices(self):
-        if not self.data:
-            return {}
-
-        symbols = [
-            symbol for symbol in self.data
-            if symbol in OKX_SYMBOL_MAP or symbol in BINANCE_SYMBOL_MAP or symbol in COIN_MAP
-        ]
-        if not symbols:
-            return {}
-
-        prices = {}
-        futures_by_symbol = {symbol: [] for symbol in symbols}
-        future_meta = {}
-        executor = ThreadPoolExecutor(max_workers=min(len(symbols) * 3, 16))
-
-        try:
-            for symbol in symbols:
-                tasks = [
-                    ("OKX", self.fetch_okx_price),
-                    ("Binance", self.fetch_binance_price),
-                    ("CoinGecko", self.fetch_coingecko_price),
-                ]
-                for source, fetch_price in tasks:
-                    future = executor.submit(fetch_price, symbol)
-                    futures_by_symbol[symbol].append(future)
-                    future_meta[future] = (symbol, source)
-
-            resolved_symbols = set()
-            for future in as_completed(future_meta):
-                symbol, source = future_meta[future]
-                if symbol in resolved_symbols:
-                    continue
-
-                try:
-                    price = future.result()
-                except Exception as e:
-                    print(f"{source} 获取 {symbol} 价格失败: {e}")
-                    continue
-
-                if price is None:
-                    continue
-
-                prices[symbol] = price
-                resolved_symbols.add(symbol)
-
-                for other_future in futures_by_symbol[symbol]:
-                    if other_future is not future:
-                        other_future.cancel()
-
-                if len(resolved_symbols) == len(symbols):
-                    break
-        finally:
-            executor.shutdown(wait=False, cancel_futures=True)
-
-        return prices
+        return self.get_latest_quotes()
 
     def fetch_okx_price(self, symbol):
-        inst_id = OKX_SYMBOL_MAP.get(symbol)
-        if not inst_id:
-            return None
-
-        url = "https://www.okx.com/api/v5/market/ticker"
-        resp = requests.get(url, params={"instId": inst_id}, timeout=PRICE_TIMEOUT)
-        resp.raise_for_status()
-        data = resp.json().get("data", [])
-        if not data:
-            return None
-        return self.parse_price(data[0].get("last"))
+        from crypto_portfolio.market_data import fetch_okx_price
+        return fetch_okx_price(symbol)
 
     def fetch_binance_price(self, symbol):
-        ticker_symbol = BINANCE_SYMBOL_MAP.get(symbol)
-        if not ticker_symbol:
-            return None
-
-        url = "https://data-api.binance.vision/api/v3/ticker/price"
-        resp = requests.get(url, params={"symbol": ticker_symbol}, timeout=PRICE_TIMEOUT)
-        resp.raise_for_status()
-        return self.parse_price(resp.json().get("price"))
+        from crypto_portfolio.market_data import fetch_binance_price
+        return fetch_binance_price(symbol)
 
     def fetch_coingecko_price(self, symbol):
-        coin_id = COIN_MAP.get(symbol)
-        if not coin_id:
-            return None
+        from crypto_portfolio.market_data import fetch_coingecko_price
+        return fetch_coingecko_price(symbol)
 
-        url = "https://api.coingecko.com/api/v3/simple/price"
-        params = {
-            "ids": coin_id,
-            "vs_currencies": "usd"
-        }
-        resp = requests.get(url, params=params, timeout=PRICE_TIMEOUT)
-        resp.raise_for_status()
-        return self.parse_price(resp.json().get(coin_id, {}).get("usd"))
-
-    def parse_price(self, value):
-        if value is None:
-            return None
-        price = float(value)
-        if price <= 0:
-            return None
-        return price
+    def fetch_asset_quote(self, asset):
+        return fetch_asset_quote(asset)
 
     def format_quantity(self, quantity):
         return f"{quantity:.8f}".rstrip("0").rstrip(".")
 
-    def print_holdings_table(self, rows):
-        print(tabulate(
-            rows,
-            headers=["币种", "数量", "成本价", "当前价", "持仓价值", "总收益", "收益率"],
-            tablefmt="grid",
-            colalign=("left", "right", "right", "right", "right", "right", "right"),
-            disable_numparse=True
-        ))
+    def format_money(self, value):
+        return f"{value:.2f}"
 
-    def build_holdings_snapshot(self, prices):
+    def build_holdings_snapshot(self, quotes, category_filter=CATEGORY_ALL):
         rows = []
+        assets_snapshot = []
         total_value = 0.0
         total_profit = 0.0
         total_cost_for_priced_assets = 0.0
         unknown_price_symbols = []
+        category_totals = {
+            category: {
+                "total_value": 0.0,
+                "total_cost": 0.0,
+                "total_profit": 0.0,
+                "total_profit_rate": 0.0,
+            }
+            for category in CATEGORIES
+        }
 
-        for symbol, asset in self.data.items():
+        assets = self.get_assets(category_filter, active_only=True)
+        for asset in assets:
+            asset_id = asset["asset_id"]
             quantity = asset["quantity"]
             total_cost = asset["total_cost"]
+            total_cost_cny = asset.get("total_cost_cny", 0.0)
             avg_cost = total_cost / quantity if quantity > 0 else 0.0
-            current_price = prices.get(symbol)
+            avg_cost_cny = total_cost_cny / quantity if quantity > 0 else 0.0
+            quote = quotes.get(asset_id) if quotes else None
+            label = asset_label(asset)
 
-            if current_price is None:
-                unknown_price_symbols.append(symbol)
+            if not quote or quote.get("price") is None:
+                unknown_price_symbols.append(label)
                 rows.append([
-                    symbol,
+                    asset["category"],
+                    MARKET_LABELS.get(asset["market"], asset["market"]),
+                    asset["symbol"],
+                    asset.get("name", asset["symbol"]),
                     self.format_quantity(quantity),
                     f"{avg_cost:.4f}",
                     "价格未知",
+                    asset["currency"],
                     "无法计算",
                     "无法计算",
-                    "无法计算"
+                    f"{total_cost_cny:.2f}",
+                    "无法计算",
+                    "无法计算",
                 ])
                 continue
 
-            value = quantity * current_price
-            profit = value - total_cost
-            profit_rate = (profit / total_cost * 100) if total_cost > 0 else 0.0
+            current_price = float(quote["price"])
+            fx_to_cny = float(quote.get("fx_to_cny", 1.0))
+            value_cny = quantity * current_price * fx_to_cny
+            profit_cny = value_cny - total_cost_cny
+            profit_rate = (profit_cny / total_cost_cny * 100) if total_cost_cny > 0 else 0.0
 
-            total_value += value
-            total_profit += profit
-            total_cost_for_priced_assets += total_cost
+            total_value += value_cny
+            total_profit += profit_cny
+            total_cost_for_priced_assets += total_cost_cny
 
-            rows.append([
-                symbol,
+            totals = category_totals[asset["category"]]
+            totals["total_value"] += value_cny
+            totals["total_cost"] += total_cost_cny
+            totals["total_profit"] += profit_cny
+
+            row = [
+                asset["category"],
+                MARKET_LABELS.get(asset["market"], asset["market"]),
+                asset["symbol"],
+                quote.get("name") or asset.get("name", asset["symbol"]),
                 self.format_quantity(quantity),
                 f"{avg_cost:.4f}",
                 f"{current_price:.4f}",
-                f"{value:.2f}",
-                f"{profit:.2f}",
-                f"{profit_rate:.2f}%"
-            ])
+                quote.get("currency", asset["currency"]),
+                f"{fx_to_cny:.4f}",
+                f"{value_cny:.2f}",
+                f"{total_cost_cny:.2f}",
+                f"{profit_cny:.2f}",
+                f"{profit_rate:.2f}%",
+            ]
+            rows.append(row)
+            assets_snapshot.append({
+                "asset_id": asset_id,
+                "label": label,
+                "category": asset["category"],
+                "market": asset["market"],
+                "market_label": MARKET_LABELS.get(asset["market"], asset["market"]),
+                "symbol": asset["symbol"],
+                "name": quote.get("name") or asset.get("name", asset["symbol"]),
+                "quantity": quantity,
+                "avg_cost": avg_cost,
+                "avg_cost_cny": avg_cost_cny,
+                "price": current_price,
+                "currency": quote.get("currency", asset["currency"]),
+                "fx_to_cny": fx_to_cny,
+                "value_cny": value_cny,
+                "total_cost_cny": total_cost_cny,
+                "profit_cny": profit_cny,
+                "profit_rate": profit_rate,
+            })
+
+        for totals in category_totals.values():
+            if totals["total_cost"] > 0:
+                totals["total_profit_rate"] = totals["total_profit"] / totals["total_cost"] * 100
 
         total_profit_rate = (
             total_profit / total_cost_for_priced_assets * 100
@@ -531,12 +741,30 @@ class PortfolioManager:
         )
 
         return {
+            "version": PORTFOLIO_VERSION,
             "saved_at": self.now(),
+            "display_currency": "CNY",
             "rows": rows,
+            "assets": assets_snapshot,
+            "category_totals": category_totals,
             "total_value": total_value,
+            "total_cost": total_cost_for_priced_assets,
             "total_profit": total_profit,
             "total_profit_rate": total_profit_rate,
-            "unknown_price_symbols": unknown_price_symbols
+            "unknown_price_symbols": unknown_price_symbols,
+        }
+
+    def build_portfolio_summary(self, quotes=None, category_filter=CATEGORY_ALL):
+        if quotes is None:
+            quotes = self.get_latest_quotes(self.get_assets(category_filter, active_only=True))
+        snapshot = self.build_holdings_snapshot(quotes, category_filter)
+        return {
+            "total_value": snapshot["total_value"],
+            "total_cost": snapshot["total_cost"],
+            "total_profit": snapshot["total_profit"],
+            "total_profit_rate": snapshot["total_profit_rate"],
+            "category_totals": snapshot["category_totals"],
+            "unknown_price_symbols": snapshot["unknown_price_symbols"],
         }
 
     def save_holdings_snapshot(self, snapshot):
@@ -550,6 +778,17 @@ class PortfolioManager:
 
         return snapshot_path
 
+    def print_holdings_table(self, rows):
+        print(tabulate(
+            rows,
+            headers=[
+                "类别", "市场", "代码", "名称", "数量", "成本价", "当前价",
+                "币种", "汇率", "持仓价值(CNY)", "成本(CNY)", "总收益(CNY)", "收益率",
+            ],
+            tablefmt="grid",
+            disable_numparse=True,
+        ))
+
     def print_holdings_snapshot(self, snapshot):
         rows = snapshot["rows"]
         unknown_price_symbols = snapshot.get("unknown_price_symbols", [])
@@ -558,7 +797,7 @@ class PortfolioManager:
 
         total_label = "可计算总持仓价值" if unknown_price_symbols else "总持仓价值"
         profit_label = "可计算总收益" if unknown_price_symbols else "总收益"
-        print(f"\n{total_label}: ${snapshot['total_value']:.2f}")
+        print(f"\n{total_label}: ¥{snapshot['total_value']:.2f}")
         print(
             f"{profit_label}: {snapshot['total_profit']:.2f} "
             f"({snapshot['total_profit_rate']:.2f}%)"
@@ -594,47 +833,44 @@ class PortfolioManager:
             return
 
         print("正在查询当前最新价格......")
-        prices = self.get_prices()
-        snapshot = self.build_holdings_snapshot(prices)
+        quotes = self.get_latest_quotes()
+        snapshot = self.build_holdings_snapshot(quotes)
         self.print_holdings_snapshot(snapshot)
         snapshot_path = self.save_holdings_snapshot(snapshot)
         print(f"本次查询结果已保存: {snapshot_path}")
 
     def show_history(self, symbol=""):
-        symbol = symbol.upper().strip()
-
         rows = []
-
         if symbol:
-            if symbol not in self.data:
-                print("未找到该币种。")
-                return
-            assets = {symbol: self.data[symbol]}
+            asset_id = self.find_asset_id(symbol, CATEGORY_CRYPTO, MARKET_CRYPTO)
+            transactions = self.get_transactions(asset_id=asset_id)
         else:
-            assets = self.data
+            transactions = self.get_transactions()
 
-        for sym, asset in assets.items():
-            for tx in asset["transactions"]:
-                rows.append([
-                    sym,
-                    tx["date"],
-                    "买入" if tx["type"] == "buy" else "卖出",
-                    tx["amount"] if tx["type"] == "buy" else -tx["amount"],
-                    tx["price"],
-                    tx["total"]
-                ])
+        for tx in transactions:
+            rows.append([
+                tx["category"],
+                tx["market_label"],
+                tx["symbol"],
+                tx["date"],
+                "买入" if tx["type"] == "buy" else "卖出",
+                tx["amount"] if tx["type"] == "buy" else -tx["amount"],
+                tx["price"],
+                tx["currency"],
+                tx["fx_to_cny"],
+                tx["total_cny"],
+            ])
 
         if not rows:
             print("暂无交易记录。")
             return
 
-        rows.sort(key=lambda x: x[1])
-
+        rows.sort(key=lambda x: x[3])
         print(tabulate(
             rows,
-            headers=["币种", "日期", "类型", "数量", "价格", "总金额"],
+            headers=["类别", "市场", "代码", "日期", "类型", "数量", "价格", "币种", "汇率", "人民币金额"],
             tablefmt="grid",
-            floatfmt=".6f"
+            floatfmt=".6f",
         ))
 
     def show_distribution(self):
@@ -643,33 +879,18 @@ class PortfolioManager:
             return
 
         print("正在查询当前最新价格......")
-        prices = self.get_prices()
-
-        values = {}
-        total_value = 0.0
-        unknown_price_symbols = []
-
-        for symbol, asset in self.data.items():
-            current_price = prices.get(symbol)
-            if current_price is None:
-                unknown_price_symbols.append(symbol)
-                continue
-            value = asset["quantity"] * current_price
-            values[symbol] = value
-            total_value += value
-
-        if total_value <= 0:
+        snapshot = self.build_holdings_snapshot(self.get_latest_quotes())
+        if snapshot["total_value"] <= 0:
             print("可计算总资产为 0，无法展示资产分布。")
-            if unknown_price_symbols:
-                print(f"价格未知，未计入资产分布: {', '.join(unknown_price_symbols)}")
+            if snapshot.get("unknown_price_symbols"):
+                print(f"价格未知，未计入资产分布: {', '.join(snapshot['unknown_price_symbols'])}")
             return
 
         print("\n资产分布:")
-        for symbol, value in sorted(values.items(), key=lambda x: x[1], reverse=True):
-            pct = value / total_value * 100
-            print(f"{symbol}: {value:.2f} ({pct:.1f}%)")
+        for asset in sorted(snapshot["assets"], key=lambda item: item["value_cny"], reverse=True):
+            pct = asset["value_cny"] / snapshot["total_value"] * 100
+            print(f"{asset['label']}: ¥{asset['value_cny']:.2f} ({pct:.1f}%)")
 
-        total_label = "可计算总价值" if unknown_price_symbols else "总价值"
-        print(f"{total_label}: ${total_value:.2f}")
-        if unknown_price_symbols:
-            print(f"价格未知，未计入资产分布: {', '.join(unknown_price_symbols)}")
+        print(f"总价值: ¥{snapshot['total_value']:.2f}")
+        if snapshot.get("unknown_price_symbols"):
+            print(f"价格未知，未计入资产分布: {', '.join(snapshot['unknown_price_symbols'])}")

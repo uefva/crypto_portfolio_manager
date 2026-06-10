@@ -8,36 +8,78 @@ from tkinter import messagebox, ttk
 
 import requests
 
-from crypto_portfolio.portfolio_manager import (
+from crypto_portfolio.market_data import (
+    CATEGORY_ALL,
+    CATEGORY_CRYPTO,
+    CATEGORY_FUND,
+    CATEGORY_STOCK,
+    CATEGORIES,
     COIN_MAP,
-    HOLDING_SNAPSHOT_DIR,
-    PortfolioManager,
+    MARKET_CRYPTO,
+    MARKET_FUND,
+    MARKET_HK,
+    MARKET_LABELS,
+    MARKET_SH,
+    MARKET_SZ,
+    MARKET_US,
+    currency_for,
+    normalize_category,
+    normalize_market,
 )
+from crypto_portfolio.portfolio_manager import PortfolioManager
+
+
+MARKET_DISPLAY_BY_CODE = {
+    code: label for code, label in MARKET_LABELS.items()
+}
+MARKET_CODE_BY_DISPLAY = {
+    label: code for code, label in MARKET_DISPLAY_BY_CODE.items()
+}
+CATEGORY_OPTIONS = (CATEGORY_FUND, CATEGORY_STOCK, CATEGORY_CRYPTO)
+CATEGORY_FILTER_OPTIONS = (CATEGORY_ALL, *CATEGORY_OPTIONS)
 
 
 class PortfolioApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("加密货币持仓管理")
-        self.geometry("1180x720")
-        self.minsize(980, 620)
+        self.title("多资产持仓管理")
+        self.geometry("1320x780")
+        self.minsize(1080, 660)
 
         self.manager = PortfolioManager()
         self.selected_transaction = None
+        self.latest_quotes = {}
 
         self.status_var = tk.StringVar(value="就绪")
+        self.holding_category_var = tk.StringVar(value=CATEGORY_ALL)
+        self.tx_category_filter_var = tk.StringVar(value=CATEGORY_ALL)
         self.holding_summary_var = tk.StringVar(value="")
+        self.tx_summary_var = tk.StringVar(value="点击“刷新收益”查看当前总资产收益")
         self.snapshot_summary_var = tk.StringVar(value="")
+
+        self.category_var = tk.StringVar(value=CATEGORY_CRYPTO)
+        self.market_var = tk.StringVar(value=MARKET_DISPLAY_BY_CODE[MARKET_CRYPTO])
+        self.symbol_var = tk.StringVar()
+        self.name_var = tk.StringVar()
+        self.tx_type_var = tk.StringVar(value="买入")
+        self.amount_var = tk.StringVar()
+        self.price_var = tk.StringVar()
+        self.currency_var = tk.StringVar(value="USD")
+        self.fx_var = tk.StringVar()
+        self.date_var = tk.StringVar(value=self.manager.now())
+
         self.chart_source_var = tk.StringVar(value="历史仓位结果")
         self.chart_metric_var = tk.StringVar(value="收益金额")
         self.chart_range_var = tk.StringVar(value="全部时间")
         self.server_url_var = tk.StringVar(value="http://687pq84al732.vicp.fun:47649")
         self.profit_chart_data = None
         self.profit_chart_layout = None
-        self.highlighted_symbol = None
-        self.chart_symbol_vars = {}
+        self.highlighted_series = None
+        self.chart_series_vars = {}
+        self.chart_series_meta = {}
 
         self.create_widgets()
+        self.update_form_market_options()
         self.refresh_all()
 
     def create_widgets(self):
@@ -66,6 +108,17 @@ class PortfolioApp(tk.Tk):
         toolbar = ttk.Frame(self.holdings_tab)
         toolbar.pack(fill="x", pady=(0, 8))
 
+        ttk.Label(toolbar, text="类别").pack(side="left")
+        filter_combo = ttk.Combobox(
+            toolbar,
+            textvariable=self.holding_category_var,
+            values=CATEGORY_FILTER_OPTIONS,
+            width=12,
+            state="readonly",
+        )
+        filter_combo.pack(side="left", padx=8)
+        filter_combo.bind("<<ComboboxSelected>>", lambda _event: self.apply_holdings_filter())
+
         self.refresh_holdings_button = ttk.Button(
             toolbar,
             text="查询并保存",
@@ -74,7 +127,10 @@ class PortfolioApp(tk.Tk):
         self.refresh_holdings_button.pack(side="left")
         ttk.Button(toolbar, text="刷新本地数据", command=self.refresh_all).pack(side="left", padx=8)
 
-        columns = ("symbol", "quantity", "avg_cost", "price", "value", "profit", "rate")
+        columns = (
+            "category", "market", "symbol", "name", "quantity", "avg_cost", "price",
+            "currency", "fx", "value_cny", "cost_cny", "profit_cny", "rate",
+        )
         self.holdings_tree = ttk.Treeview(
             self.holdings_tab,
             columns=columns,
@@ -82,114 +138,187 @@ class PortfolioApp(tk.Tk):
             height=18,
         )
         headings = {
-            "symbol": "币种",
+            "category": "类别",
+            "market": "市场",
+            "symbol": "代码",
+            "name": "名称",
             "quantity": "数量",
             "avg_cost": "成本价",
             "price": "当前价",
-            "value": "持仓价值",
-            "profit": "总收益",
+            "currency": "币种",
+            "fx": "汇率",
+            "value_cny": "持仓价值(CNY)",
+            "cost_cny": "成本(CNY)",
+            "profit_cny": "收益(CNY)",
             "rate": "收益率",
         }
         widths = {
+            "category": 80,
+            "market": 90,
             "symbol": 90,
-            "quantity": 150,
-            "avg_cost": 130,
-            "price": 130,
-            "value": 130,
-            "profit": 130,
-            "rate": 110,
+            "name": 160,
+            "quantity": 120,
+            "avg_cost": 100,
+            "price": 100,
+            "currency": 70,
+            "fx": 80,
+            "value_cny": 130,
+            "cost_cny": 120,
+            "profit_cny": 120,
+            "rate": 90,
         }
         for column in columns:
-            anchor = "w" if column == "symbol" else "e"
+            anchor = "w" if column in {"category", "market", "symbol", "name", "currency"} else "e"
             self.holdings_tree.heading(column, text=headings[column])
             self.holdings_tree.column(column, width=widths[column], anchor=anchor)
         self.configure_rate_tags(self.holdings_tree)
         self.configure_sortable_tree(self.holdings_tree, headings)
-
         self.holdings_tree.pack(fill="both", expand=True)
         ttk.Label(self.holdings_tab, textvariable=self.holding_summary_var, anchor="w").pack(
             fill="x", pady=(8, 0)
         )
 
     def create_transactions_tab(self):
+        summary_bar = ttk.Frame(self.transactions_tab)
+        summary_bar.pack(fill="x", pady=(0, 8))
+        ttk.Label(summary_bar, text="筛选").pack(side="left")
+        filter_combo = ttk.Combobox(
+            summary_bar,
+            textvariable=self.tx_category_filter_var,
+            values=CATEGORY_FILTER_OPTIONS,
+            width=12,
+            state="readonly",
+        )
+        filter_combo.pack(side="left", padx=8)
+        filter_combo.bind("<<ComboboxSelected>>", lambda _event: self.refresh_transactions())
+        ttk.Button(summary_bar, text="刷新收益", command=self.refresh_transaction_summary).pack(side="left")
+        ttk.Label(summary_bar, textvariable=self.tx_summary_var, anchor="w").pack(
+            side="left", padx=12, fill="x", expand=True
+        )
+
         form = ttk.LabelFrame(self.transactions_tab, text="新增 / 编辑交易")
         form.pack(fill="x", pady=(0, 8))
 
-        self.symbol_var = tk.StringVar()
-        self.tx_type_var = tk.StringVar(value="买入")
-        self.amount_var = tk.StringVar()
-        self.price_var = tk.StringVar()
-        self.date_var = tk.StringVar(value=self.manager.now())
+        ttk.Label(form, text="类别").grid(row=0, column=0, padx=6, pady=6, sticky="w")
+        category_combo = ttk.Combobox(
+            form,
+            textvariable=self.category_var,
+            values=CATEGORY_OPTIONS,
+            width=12,
+            state="readonly",
+        )
+        category_combo.grid(row=0, column=1, padx=6, pady=6, sticky="we")
+        category_combo.bind("<<ComboboxSelected>>", lambda _event: self.update_form_market_options())
 
-        ttk.Label(form, text="币种").grid(row=0, column=0, padx=8, pady=8, sticky="w")
-        self.symbol_combo = ttk.Combobox(form, textvariable=self.symbol_var, width=14)
-        self.symbol_combo.grid(row=0, column=1, padx=8, pady=8, sticky="we")
+        ttk.Label(form, text="市场").grid(row=0, column=2, padx=6, pady=6, sticky="w")
+        self.market_combo = ttk.Combobox(
+            form,
+            textvariable=self.market_var,
+            width=12,
+            state="readonly",
+        )
+        self.market_combo.grid(row=0, column=3, padx=6, pady=6, sticky="we")
+        self.market_combo.bind("<<ComboboxSelected>>", lambda _event: self.update_currency_from_form())
 
-        ttk.Label(form, text="类型").grid(row=0, column=2, padx=8, pady=8, sticky="w")
+        ttk.Label(form, text="代码").grid(row=0, column=4, padx=6, pady=6, sticky="w")
+        self.symbol_combo = ttk.Combobox(form, textvariable=self.symbol_var, width=16)
+        self.symbol_combo.grid(row=0, column=5, padx=6, pady=6, sticky="we")
+
+        ttk.Label(form, text="名称").grid(row=0, column=6, padx=6, pady=6, sticky="w")
+        ttk.Entry(form, textvariable=self.name_var, width=18).grid(
+            row=0, column=7, padx=6, pady=6, sticky="we"
+        )
+
+        ttk.Label(form, text="类型").grid(row=1, column=0, padx=6, pady=6, sticky="w")
         ttk.Combobox(
             form,
             textvariable=self.tx_type_var,
             values=("买入", "卖出"),
-            width=10,
+            width=12,
             state="readonly",
-        ).grid(row=0, column=3, padx=8, pady=8, sticky="we")
+        ).grid(row=1, column=1, padx=6, pady=6, sticky="we")
 
-        ttk.Label(form, text="数量").grid(row=0, column=4, padx=8, pady=8, sticky="w")
+        ttk.Label(form, text="数量").grid(row=1, column=2, padx=6, pady=6, sticky="w")
         ttk.Entry(form, textvariable=self.amount_var, width=16).grid(
-            row=0, column=5, padx=8, pady=8, sticky="we"
+            row=1, column=3, padx=6, pady=6, sticky="we"
         )
 
-        ttk.Label(form, text="价格(USD)").grid(row=1, column=0, padx=8, pady=8, sticky="w")
+        ttk.Label(form, text="价格").grid(row=1, column=4, padx=6, pady=6, sticky="w")
         ttk.Entry(form, textvariable=self.price_var, width=16).grid(
-            row=1, column=1, padx=8, pady=8, sticky="we"
+            row=1, column=5, padx=6, pady=6, sticky="we"
         )
 
-        ttk.Label(form, text="日期").grid(row=1, column=2, padx=8, pady=8, sticky="w")
-        ttk.Entry(form, textvariable=self.date_var, width=24).grid(
-            row=1, column=3, padx=8, pady=8, sticky="we"
+        ttk.Label(form, text="币种").grid(row=1, column=6, padx=6, pady=6, sticky="w")
+        ttk.Label(form, textvariable=self.currency_var, width=8).grid(
+            row=1, column=7, padx=6, pady=6, sticky="w"
+        )
+
+        ttk.Label(form, text="汇率(CNY)").grid(row=2, column=0, padx=6, pady=6, sticky="w")
+        ttk.Entry(form, textvariable=self.fx_var, width=16).grid(
+            row=2, column=1, padx=6, pady=6, sticky="we"
+        )
+
+        ttk.Label(form, text="日期").grid(row=2, column=2, padx=6, pady=6, sticky="w")
+        ttk.Entry(form, textvariable=self.date_var, width=22).grid(
+            row=2, column=3, columnspan=2, padx=6, pady=6, sticky="we"
         )
 
         buttons = ttk.Frame(form)
-        buttons.grid(row=1, column=4, columnspan=2, padx=8, pady=8, sticky="e")
+        buttons.grid(row=2, column=5, columnspan=3, padx=6, pady=6, sticky="e")
         ttk.Button(buttons, text="新增", command=self.add_transaction).pack(side="left")
         ttk.Button(buttons, text="保存修改", command=self.update_transaction).pack(side="left", padx=8)
         ttk.Button(buttons, text="删除选中", command=self.delete_selected_transaction).pack(side="left")
         ttk.Button(buttons, text="清空", command=self.clear_transaction_form).pack(side="left", padx=(8, 0))
 
-        for column in range(6):
+        for column in range(8):
             form.columnconfigure(column, weight=1)
 
-        columns = ("symbol", "index", "type", "date", "amount", "price", "total")
+        columns = (
+            "category", "market", "symbol", "name", "index", "type", "date",
+            "amount", "price", "currency", "fx", "total_cny", "asset_id",
+        )
         self.transactions_tree = ttk.Treeview(
             self.transactions_tab,
             columns=columns,
             show="headings",
-            height=18,
+            height=16,
         )
         headings = {
-            "symbol": "币种",
+            "category": "类别",
+            "market": "市场",
+            "symbol": "代码",
+            "name": "名称",
             "index": "序号",
             "type": "类型",
             "date": "日期",
             "amount": "数量",
             "price": "价格",
-            "total": "总金额",
+            "currency": "币种",
+            "fx": "汇率",
+            "total_cny": "人民币金额",
+            "asset_id": "资产ID",
         }
         widths = {
-            "symbol": 80,
-            "index": 70,
-            "type": 80,
-            "date": 170,
-            "amount": 140,
-            "price": 130,
-            "total": 130,
+            "category": 80,
+            "market": 90,
+            "symbol": 90,
+            "name": 150,
+            "index": 60,
+            "type": 70,
+            "date": 160,
+            "amount": 110,
+            "price": 100,
+            "currency": 60,
+            "fx": 80,
+            "total_cny": 120,
+            "asset_id": 1,
         }
         for column in columns:
-            anchor = "w" if column in {"symbol", "type", "date"} else "e"
+            anchor = "w" if column in {"category", "market", "symbol", "name", "type", "date", "currency"} else "e"
             self.transactions_tree.heading(column, text=headings[column])
-            self.transactions_tree.column(column, width=widths[column], anchor=anchor)
+            self.transactions_tree.column(column, width=widths[column], anchor=anchor, stretch=column != "asset_id")
+        self.transactions_tree.column("asset_id", width=1, minwidth=1, stretch=False)
         self.configure_sortable_tree(self.transactions_tree, headings)
-
         self.transactions_tree.pack(fill="both", expand=True)
         self.transactions_tree.bind("<<TreeviewSelect>>", self.on_transaction_select)
 
@@ -200,7 +329,7 @@ class PortfolioApp(tk.Tk):
         left = ttk.Frame(outer)
         right = ttk.Frame(outer)
         outer.add(left, weight=1)
-        outer.add(right, weight=2)
+        outer.add(right, weight=3)
 
         left_toolbar = ttk.Frame(left)
         left_toolbar.pack(fill="x", pady=(0, 8))
@@ -218,9 +347,9 @@ class PortfolioApp(tk.Tk):
         snapshot_headings = {}
         for column, title, width in (
             ("saved_at", "查询时间", 170),
-            ("value", "总价值", 100),
-            ("profit", "总收益", 100),
-            ("path", "文件", 220),
+            ("value", "总价值(CNY)", 120),
+            ("profit", "总收益(CNY)", 120),
+            ("path", "文件", 240),
         ):
             snapshot_headings[column] = title
             self.snapshots_tree.heading(column, text=title)
@@ -229,25 +358,34 @@ class PortfolioApp(tk.Tk):
         self.snapshots_tree.pack(fill="both", expand=True)
         self.snapshots_tree.bind("<<TreeviewSelect>>", self.on_snapshot_select)
 
+        detail_columns = (
+            "category", "market", "symbol", "name", "quantity", "avg_cost", "price",
+            "currency", "fx", "value_cny", "cost_cny", "profit_cny", "rate",
+        )
         self.snapshot_detail_tree = ttk.Treeview(
             right,
-            columns=("symbol", "quantity", "avg_cost", "price", "value", "profit", "rate"),
+            columns=detail_columns,
             show="headings",
         )
-        detail_headings = {}
-        for column, title, width in (
-            ("symbol", "币种", 80),
-            ("quantity", "数量", 130),
-            ("avg_cost", "成本价", 120),
-            ("price", "当前价", 120),
-            ("value", "持仓价值", 120),
-            ("profit", "总收益", 120),
-            ("rate", "收益率", 100),
-        ):
-            detail_headings[column] = title
-            anchor = "w" if column == "symbol" else "e"
+        detail_headings = {
+            "category": "类别",
+            "market": "市场",
+            "symbol": "代码",
+            "name": "名称",
+            "quantity": "数量",
+            "avg_cost": "成本价",
+            "price": "当前价",
+            "currency": "币种",
+            "fx": "汇率",
+            "value_cny": "持仓价值(CNY)",
+            "cost_cny": "成本(CNY)",
+            "profit_cny": "收益(CNY)",
+            "rate": "收益率",
+        }
+        for column, title in detail_headings.items():
+            anchor = "w" if column in {"category", "market", "symbol", "name", "currency"} else "e"
             self.snapshot_detail_tree.heading(column, text=title)
-            self.snapshot_detail_tree.column(column, width=width, anchor=anchor)
+            self.snapshot_detail_tree.column(column, width=110, anchor=anchor)
         self.configure_rate_tags(self.snapshot_detail_tree)
         self.configure_sortable_tree(self.snapshot_detail_tree, detail_headings)
         self.snapshot_detail_tree.pack(fill="both", expand=True)
@@ -295,6 +433,15 @@ class PortfolioApp(tk.Tk):
         ttk.Label(toolbar, text="服务端").pack(side="left")
         ttk.Entry(toolbar, textvariable=self.server_url_var, width=28).pack(side="left", padx=8)
         ttk.Button(toolbar, text="刷新图表", command=self.refresh_profit_chart).pack(side="left")
+        ttk.Button(toolbar, text="总资产", command=lambda: self.select_chart_group(CATEGORY_ALL)).pack(
+            side="left", padx=(8, 0)
+        )
+        for category in CATEGORY_OPTIONS:
+            ttk.Button(
+                toolbar,
+                text=category,
+                command=lambda value=category: self.select_chart_group(value),
+            ).pack(side="left", padx=(4, 0))
         ttk.Button(toolbar, text="清除高亮", command=self.clear_chart_highlight).pack(
             side="left", padx=8
         )
@@ -305,11 +452,11 @@ class PortfolioApp(tk.Tk):
         self.chart_symbol_panel = ttk.LabelFrame(chart_body, text="展示曲线", padding=(8, 6))
         self.chart_symbol_panel.pack(side="right", fill="y", padx=(8, 0))
         self.chart_symbol_panel.pack_propagate(False)
-        self.chart_symbol_panel.configure(width=150)
+        self.chart_symbol_panel.configure(width=190)
         self.chart_symbol_canvas = tk.Canvas(
             self.chart_symbol_panel,
             highlightthickness=0,
-            width=126,
+            width=166,
         )
         self.chart_symbol_scrollbar = ttk.Scrollbar(
             self.chart_symbol_panel,
@@ -353,11 +500,45 @@ class PortfolioApp(tk.Tk):
         self.status_var.set("本地数据已刷新")
 
     def refresh_symbols(self):
-        symbols = []
-        for symbol in self.manager.get_symbols() + sorted(COIN_MAP.keys()):
-            if symbol not in symbols:
-                symbols.append(symbol)
-        self.symbol_combo["values"] = symbols
+        assets = self.manager.get_assets()
+        values = sorted({
+            asset["symbol"] for asset in assets
+        } | set(COIN_MAP.keys()))
+        self.symbol_combo["values"] = values
+
+    def current_form_market(self):
+        return MARKET_CODE_BY_DISPLAY.get(self.market_var.get(), self.market_var.get())
+
+    def update_form_market_options(self):
+        category = normalize_category(self.category_var.get())
+        if category == CATEGORY_FUND:
+            markets = [MARKET_FUND]
+        elif category == CATEGORY_STOCK:
+            markets = [MARKET_SH, MARKET_SZ, MARKET_HK, MARKET_US]
+        else:
+            markets = [MARKET_CRYPTO]
+        displays = [MARKET_DISPLAY_BY_CODE[market] for market in markets]
+        self.market_combo["values"] = displays
+        if self.market_var.get() not in displays:
+            self.market_var.set(displays[0])
+        self.update_currency_from_form()
+
+    def update_currency_from_form(self):
+        category = normalize_category(self.category_var.get())
+        market = normalize_market(self.current_form_market(), category)
+        currency = currency_for(category, market)
+        self.currency_var.set(currency)
+        if currency == "CNY" and not self.fx_var.get().strip():
+            self.fx_var.set("1")
+
+    def apply_holdings_filter(self):
+        if self.latest_quotes:
+            snapshot = self.manager.build_holdings_snapshot(
+                self.latest_quotes,
+                self.holding_category_var.get(),
+            )
+            self.fill_tree(self.holdings_tree, snapshot["rows"], self.rate_tag_for_row)
+            self.holding_summary_var.set(self.format_snapshot_summary(snapshot))
 
     def refresh_holdings(self):
         if not self.manager.data:
@@ -367,13 +548,15 @@ class PortfolioApp(tk.Tk):
         self.refresh_holdings_button.configure(state="disabled")
 
         def task():
-            prices = self.manager.get_prices()
-            snapshot = self.manager.build_holdings_snapshot(prices)
+            assets = self.manager.get_assets(self.holding_category_var.get(), active_only=True)
+            quotes = self.manager.get_latest_quotes(assets)
+            snapshot = self.manager.build_holdings_snapshot(quotes, self.holding_category_var.get())
             snapshot_path = self.manager.save_holdings_snapshot(snapshot)
-            return snapshot, snapshot_path
+            return quotes, snapshot, snapshot_path
 
         def on_success(result):
-            snapshot, snapshot_path = result
+            quotes, snapshot, snapshot_path = result
+            self.latest_quotes.update(quotes)
             self.fill_tree(self.holdings_tree, snapshot["rows"], self.rate_tag_for_row)
             self.holding_summary_var.set(self.format_snapshot_summary(snapshot))
             self.refresh_snapshots()
@@ -383,6 +566,30 @@ class PortfolioApp(tk.Tk):
             self.refresh_holdings_button.configure(state="normal")
 
         self.run_background(task, on_success, "正在查询价格...", on_done=on_done)
+
+    def refresh_transaction_summary(self):
+        if not self.manager.data:
+            self.tx_summary_var.set("暂无持仓")
+            return
+
+        category = self.tx_category_filter_var.get()
+
+        def task():
+            return self.manager.build_portfolio_summary(category_filter=category)
+
+        def on_success(summary):
+            unknown = summary.get("unknown_price_symbols", [])
+            text = (
+                f"总价值: ¥{summary['total_value']:.2f}    "
+                f"成本: ¥{summary['total_cost']:.2f}    "
+                f"收益: {summary['total_profit']:.2f} "
+                f"({summary['total_profit_rate']:.2f}%)"
+            )
+            if unknown:
+                text += f"    未计入: {', '.join(unknown)}"
+            self.tx_summary_var.set(text)
+
+        self.run_background(task, on_success, "正在计算总资产收益...")
 
     def run_background(self, task, on_success, busy_message, on_done=None):
         self.status_var.set(busy_message)
@@ -411,17 +618,24 @@ class PortfolioApp(tk.Tk):
         messagebox.showerror("操作失败", str(error))
 
     def refresh_transactions(self):
-        transactions = self.manager.get_transactions()
+        category = self.tx_category_filter_var.get()
+        transactions = self.manager.get_transactions(category=category)
         rows = []
         for tx in transactions:
             rows.append((
+                tx["category"],
+                tx["market_label"],
                 tx["symbol"],
+                tx["name"],
                 tx["index"],
                 "买入" if tx["type"] == "buy" else "卖出",
                 tx["date"],
                 tx["amount"],
                 tx["price"],
-                tx["total"],
+                tx["currency"],
+                f"{float(tx['fx_to_cny']):.4f}",
+                f"{float(tx['total_cny']):.2f}",
+                tx["asset_id"],
             ))
         self.fill_tree(self.transactions_tree, rows)
 
@@ -509,7 +723,7 @@ class PortfolioApp(tk.Tk):
             return (2, text.upper())
 
     def parse_metric_value(self, value):
-        text = str(value).strip().replace(",", "").replace("$", "")
+        text = str(value).strip().replace(",", "").replace("$", "").replace("¥", "")
         if text.endswith("%"):
             text = text[:-1]
         return float(text)
@@ -521,18 +735,15 @@ class PortfolioApp(tk.Tk):
         tree.tag_configure("profit_unknown", foreground="#777777")
 
     def rate_tag_for_row(self, row):
-        if len(row) < 7:
+        if len(row) < 13:
             return ()
-
-        rate_text = str(row[6]).strip()
+        rate_text = str(row[12]).strip()
         if not rate_text.endswith("%"):
             return ("profit_unknown",)
-
         try:
             rate = float(rate_text.rstrip("%"))
         except ValueError:
             return ("profit_unknown",)
-
         if rate > 0:
             return ("profit_positive",)
         if rate < 0:
@@ -544,10 +755,18 @@ class PortfolioApp(tk.Tk):
         total_label = "可计算总持仓价值" if unknown else "总持仓价值"
         profit_label = "可计算总收益" if unknown else "总收益"
         summary = (
-            f"{total_label}: ${snapshot['total_value']:.2f}    "
-            f"{profit_label}: {snapshot['total_profit']:.2f} "
-            f"({snapshot['total_profit_rate']:.2f}%)"
+            f"{total_label}: ¥{snapshot.get('total_value', 0.0):.2f}    "
+            f"{profit_label}: {snapshot.get('total_profit', 0.0):.2f} "
+            f"({snapshot.get('total_profit_rate', 0.0):.2f}%)"
         )
+        category_totals = snapshot.get("category_totals", {})
+        parts = []
+        for category in CATEGORY_OPTIONS:
+            total = category_totals.get(category, {})
+            if total.get("total_value", 0) or total.get("total_cost", 0):
+                parts.append(f"{category}: {total.get('total_profit', 0.0):.2f}")
+        if parts:
+            summary += "    " + " / ".join(parts)
         if unknown:
             summary += f"    未计入: {', '.join(unknown)}"
         return summary
@@ -565,17 +784,22 @@ class PortfolioApp(tk.Tk):
 
     def apply_profit_chart_data(self, data):
         self.profit_chart_data = self.filter_profit_chart_data(data)
-        if self.highlighted_symbol not in self.profit_chart_data["series"]:
-            self.highlighted_symbol = None
+        if self.highlighted_series not in self.profit_chart_data["series"]:
+            self.highlighted_series = None
         self.draw_profit_chart()
+
+    def series_value(self, profit, cost, metric):
+        if metric == "收益率":
+            return profit / cost * 100 if cost > 0 else 0.0
+        return profit
 
     def build_profit_chart_data(self):
         snapshots = list(reversed(self.manager.list_holdings_snapshots()))
         metric = self.chart_metric_var.get()
-        value_index = 6 if metric == "收益率" else 5
         range_start = self.get_chart_range_start()
         labels = []
         series = {}
+        meta = {}
 
         for _path, snapshot in snapshots:
             saved_at = snapshot.get("saved_at", "未知")
@@ -584,118 +808,158 @@ class PortfolioApp(tk.Tk):
 
             point_index = len(labels)
             labels.append(saved_at)
-
+            total_profit = float(snapshot.get("total_profit", 0.0))
+            total_cost = float(snapshot.get("total_cost", 0.0))
             total_value = (
-                snapshot.get("total_profit_rate", 0.0)
+                float(snapshot.get("total_profit_rate", 0.0))
                 if metric == "收益率"
-                else snapshot.get("total_profit", 0.0)
+                else total_profit
             )
-            series.setdefault("总收益", []).append((point_index, float(total_value)))
+            series.setdefault("总资产", []).append((point_index, total_value))
+            meta["总资产"] = {"kind": "total"}
 
-            for row in snapshot.get("rows", []):
-                if len(row) <= value_index:
+            category_totals = snapshot.get("category_totals", {})
+            for category in CATEGORY_OPTIONS:
+                totals = category_totals.get(category, {})
+                profit = float(totals.get("total_profit", 0.0))
+                cost = float(totals.get("total_cost", 0.0))
+                if cost <= 0 and profit == 0:
                     continue
-                symbol = str(row[0])
-                try:
-                    value = self.parse_metric_value(row[value_index])
-                except ValueError:
-                    continue
-                series.setdefault(symbol, []).append((point_index, value))
+                key = f"{category}合计"
+                series.setdefault(key, []).append((point_index, self.series_value(profit, cost, metric)))
+                meta[key] = {"kind": "category", "category": category}
+
+            if snapshot.get("assets"):
+                for asset in snapshot.get("assets", []):
+                    key = asset.get("label") or f"{asset.get('category', '')} {asset.get('symbol', '')}"
+                    profit = float(asset.get("profit_cny", 0.0))
+                    cost = float(asset.get("total_cost_cny", 0.0))
+                    series.setdefault(key, []).append((point_index, self.series_value(profit, cost, metric)))
+                    meta[key] = {"kind": "asset", "category": asset.get("category"), "asset_id": asset.get("asset_id")}
+            else:
+                for row in snapshot.get("rows", []):
+                    if len(row) < 7:
+                        continue
+                    symbol = str(row[0])
+                    try:
+                        value = self.parse_metric_value(row[6 if metric == "收益率" else 5])
+                    except ValueError:
+                        continue
+                    key = f"{CATEGORY_CRYPTO} {symbol}"
+                    series.setdefault(key, []).append((point_index, value))
+                    meta[key] = {"kind": "asset", "category": CATEGORY_CRYPTO}
 
         all_series = {
-            symbol: points
-            for symbol, points in sorted(series.items(), key=self.chart_symbol_sort_key)
+            key: points
+            for key, points in sorted(series.items(), key=self.chart_series_sort_key)
             if points
         }
         return {
             "labels": labels,
             "series": all_series,
             "all_series": all_series,
+            "series_meta": meta,
             "metric": metric,
             "source": "snapshots",
         }
 
     def build_server_profit_chart_data(self):
         holdings = {
-            symbol: asset.copy()
-            for symbol, asset in self.manager.data.items()
-            if asset.get("quantity", 0) > 0 and asset.get("total_cost", 0) > 0
+            asset["asset_id"]: asset
+            for asset in self.manager.get_active_assets()
+            if asset.get("quantity", 0) > 0 and asset.get("total_cost_cny", 0) > 0
         }
         metric = self.chart_metric_var.get()
         if not holdings:
-            return {"labels": [], "series": {}, "metric": metric, "source": "server"}
+            return {"labels": [], "series": {}, "all_series": {}, "series_meta": {}, "metric": metric, "source": "server"}
 
         server_url = self.normalize_server_url()
-
         params = {
-            "symbols": ",".join(sorted(holdings.keys())),
+            "asset_ids": ",".join(sorted(holdings)),
             "limit": "5000",
         }
         range_start = self.get_chart_range_start()
         if range_start:
             params["start"] = range_start.strftime("%Y-%m-%d %H:%M:%S")
-        payload = self.fetch_server_json(server_url, "/api/prices/history", params)
+        payload = self.fetch_server_json(server_url, "/api/assets/history", params)
 
         labels = []
         series = {}
+        meta = {"总资产": {"kind": "total"}}
         for point in payload.get("points", []):
-            prices = point.get("prices", {})
             timestamp = point.get("timestamp", "未知")
             if not self.is_chart_time_in_range(timestamp, range_start):
                 continue
 
+            price_cny = point.get("price_cny", {})
+            point_index = len(labels)
             point_values = {}
+            category_values = {
+                category: {"profit": 0.0, "cost": 0.0, "has_value": False}
+                for category in CATEGORY_OPTIONS
+            }
             total_profit = 0.0
             total_cost = 0.0
 
-            for symbol, asset in holdings.items():
-                price = prices.get(symbol)
+            for asset_id, asset in holdings.items():
+                price = price_cny.get(asset_id)
                 if price is None:
                     continue
-
-                profit = asset["quantity"] * float(price) - asset["total_cost"]
-                if metric == "收益率":
-                    value = profit / asset["total_cost"] * 100
-                else:
-                    value = profit
-                point_values[symbol] = value
+                value = asset["quantity"] * float(price)
+                cost = asset["total_cost_cny"]
+                profit = value - cost
+                point_values[asset_id] = (profit, cost)
                 total_profit += profit
-                total_cost += asset["total_cost"]
+                total_cost += cost
+                category_bucket = category_values[asset["category"]]
+                category_bucket["profit"] += profit
+                category_bucket["cost"] += cost
+                category_bucket["has_value"] = True
 
             if not point_values:
                 continue
 
-            point_index = len(labels)
             labels.append(timestamp)
-            if metric == "收益率":
-                total_value = total_profit / total_cost * 100 if total_cost > 0 else 0.0
-            else:
-                total_value = total_profit
-            series.setdefault("总收益", []).append((point_index, total_value))
-            for symbol, value in point_values.items():
-                series.setdefault(symbol, []).append((point_index, value))
+            series.setdefault("总资产", []).append((point_index, self.series_value(total_profit, total_cost, metric)))
+            for category, bucket in category_values.items():
+                if not bucket["has_value"]:
+                    continue
+                key = f"{category}合计"
+                series.setdefault(key, []).append((point_index, self.series_value(bucket["profit"], bucket["cost"], metric)))
+                meta[key] = {"kind": "category", "category": category}
+
+            for asset_id, (profit, cost) in point_values.items():
+                asset = holdings[asset_id]
+                key = self.chart_asset_series_label(asset)
+                series.setdefault(key, []).append((point_index, self.series_value(profit, cost, metric)))
+                meta[key] = {"kind": "asset", "category": asset["category"], "asset_id": asset_id}
 
         all_series = {
-            symbol: points
-            for symbol, points in sorted(series.items(), key=self.chart_symbol_sort_key)
+            key: points
+            for key, points in sorted(series.items(), key=self.chart_series_sort_key)
             if points
         }
         return {
             "labels": labels,
             "series": all_series,
             "all_series": all_series,
+            "series_meta": meta,
             "metric": metric,
             "source": "server",
         }
+
+    def chart_asset_series_label(self, asset):
+        name = asset.get("name") or asset.get("symbol")
+        if name and name != asset.get("symbol"):
+            return f"{asset['category']} {asset['symbol']} {name}"
+        return f"{asset['category']} {asset['symbol']}"
 
     def normalize_server_url(self):
         server_url = self.server_url_var.get().strip().rstrip("/")
         if not server_url:
             raise ValueError("服务端地址不能为空。")
-
         if "://" not in server_url:
             server_url = f"http://{server_url}"
-
         parsed = urlparse(server_url)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise ValueError("服务端地址格式不正确，请使用 http://域名:端口。")
@@ -736,28 +1000,30 @@ class PortfolioApp(tk.Tk):
         finally:
             session.close()
 
-    def chart_symbol_sort_key(self, item):
-        symbol = item[0] if isinstance(item, tuple) else item
-        if symbol == "总收益":
-            return (0, symbol)
-        return (1, symbol)
+    def chart_series_sort_key(self, item):
+        key = item[0] if isinstance(item, tuple) else item
+        if key == "总资产":
+            return (0, key)
+        for index, category in enumerate(CATEGORY_OPTIONS, start=1):
+            if key == f"{category}合计":
+                return (index, key)
+        return (10, key)
 
     def filter_profit_chart_data(self, data):
         all_series = data.get("all_series", data.get("series", {}))
-        available_symbols = list(all_series.keys())
-        self.update_chart_symbol_selector(available_symbols)
-
-        selected_symbols = self.get_selected_chart_symbols(available_symbols)
+        self.chart_series_meta = data.get("series_meta", {})
+        available = list(all_series.keys())
+        self.update_chart_symbol_selector(available)
+        selected = self.get_selected_chart_series(available)
         filtered_series = {
-            symbol: points
-            for symbol, points in all_series.items()
-            if symbol in selected_symbols
+            key: points
+            for key, points in all_series.items()
+            if key in selected
         }
-
-        filtered_data = data.copy()
-        filtered_data["all_series"] = all_series
-        filtered_data["series"] = filtered_series
-        return filtered_data
+        filtered = data.copy()
+        filtered["all_series"] = all_series
+        filtered["series"] = filtered_series
+        return filtered
 
     def chart_color_palette(self):
         return [
@@ -773,12 +1039,12 @@ class PortfolioApp(tk.Tk):
             "#5d4037",
         ]
 
-    def get_chart_color_map(self, symbols):
+    def get_chart_color_map(self, series_names):
         palette = self.chart_color_palette()
-        sorted_symbols = sorted(symbols, key=self.chart_symbol_sort_key)
+        sorted_names = sorted(series_names, key=self.chart_series_sort_key)
         return {
-            symbol: palette[index % len(palette)]
-            for index, symbol in enumerate(sorted_symbols)
+            name: palette[index % len(palette)]
+            for index, name in enumerate(sorted_names)
         }
 
     def on_chart_symbol_canvas_configure(self, event):
@@ -790,34 +1056,32 @@ class PortfolioApp(tk.Tk):
             return
         self.chart_symbol_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
 
-    def update_chart_symbol_selector(self, available_symbols):
-        available_symbols = sorted(available_symbols, key=self.chart_symbol_sort_key)
+    def update_chart_symbol_selector(self, available_series):
+        available_series = sorted(available_series, key=self.chart_series_sort_key)
         if not hasattr(self, "chart_symbol_list_frame"):
             return
 
         for child in self.chart_symbol_list_frame.winfo_children():
             child.destroy()
 
-        if not available_symbols:
+        if not available_series:
             ttk.Label(self.chart_symbol_list_frame, text="暂无曲线").pack(anchor="w")
             return
 
-        existing_symbols = set(self.chart_symbol_vars)
-        for symbol in list(existing_symbols - set(available_symbols)):
-            del self.chart_symbol_vars[symbol]
+        for key in list(set(self.chart_series_vars) - set(available_series)):
+            del self.chart_series_vars[key]
 
-        has_existing_selection = any(var.get() for var in self.chart_symbol_vars.values())
-        for symbol in available_symbols:
-            if symbol not in self.chart_symbol_vars:
-                default_selected = symbol == "总收益" and not has_existing_selection
-                self.chart_symbol_vars[symbol] = tk.BooleanVar(value=default_selected)
+        has_existing_selection = any(var.get() for var in self.chart_series_vars.values())
+        for key in available_series:
+            if key not in self.chart_series_vars:
+                self.chart_series_vars[key] = tk.BooleanVar(value=key == "总资产" and not has_existing_selection)
 
-        if not any(self.chart_symbol_vars[symbol].get() for symbol in available_symbols):
-            default_symbol = "总收益" if "总收益" in available_symbols else available_symbols[0]
-            self.chart_symbol_vars[default_symbol].set(True)
+        if not any(self.chart_series_vars[key].get() for key in available_series):
+            default_key = "总资产" if "总资产" in available_series else available_series[0]
+            self.chart_series_vars[default_key].set(True)
 
-        color_map = self.get_chart_color_map(available_symbols)
-        for symbol in available_symbols:
+        color_map = self.get_chart_color_map(available_series)
+        for key in available_series:
             row = ttk.Frame(self.chart_symbol_list_frame)
             row.pack(fill="x", pady=2)
             row.bind("<MouseWheel>", self.on_chart_symbol_mousewheel)
@@ -825,50 +1089,71 @@ class PortfolioApp(tk.Tk):
             swatch = tk.Label(
                 row,
                 text="■",
-                fg=color_map.get(symbol, "#333333"),
+                fg=color_map.get(key, "#333333"),
                 width=2,
                 cursor="hand2",
             )
             swatch.pack(side="left")
-            swatch.bind("<Button-1>", lambda _event, sym=symbol: self.toggle_chart_highlight(sym))
+            swatch.bind("<Button-1>", lambda _event, name=key: self.toggle_chart_highlight(name))
             swatch.bind("<MouseWheel>", self.on_chart_symbol_mousewheel)
 
-            label = f"{symbol} 选中" if self.highlighted_symbol == symbol else symbol
+            label = f"{key} 选中" if self.highlighted_series == key else key
             checkbutton = ttk.Checkbutton(
                 row,
                 text=label,
-                variable=self.chart_symbol_vars[symbol],
+                variable=self.chart_series_vars[key],
                 command=self.on_chart_symbol_selection_changed,
             )
             checkbutton.pack(side="left", fill="x", expand=True)
             checkbutton.bind("<MouseWheel>", self.on_chart_symbol_mousewheel)
 
-    def get_selected_chart_symbols(self, available_symbols):
+    def get_selected_chart_series(self, available_series):
         selected = [
-            symbol for symbol in available_symbols
-            if self.chart_symbol_vars.get(symbol) and self.chart_symbol_vars[symbol].get()
+            key for key in available_series
+            if self.chart_series_vars.get(key) and self.chart_series_vars[key].get()
         ]
         if selected:
             return set(selected)
-
-        if "总收益" in available_symbols:
-            self.chart_symbol_vars["总收益"].set(True)
-            return {"总收益"}
-        if available_symbols:
-            self.chart_symbol_vars[available_symbols[0]].set(True)
-            return {available_symbols[0]}
+        if "总资产" in available_series:
+            self.chart_series_vars["总资产"].set(True)
+            return {"总资产"}
+        if available_series:
+            self.chart_series_vars[available_series[0]].set(True)
+            return {available_series[0]}
         return set()
 
+    def select_chart_group(self, group):
+        if not self.chart_series_vars:
+            self.refresh_profit_chart()
+            return
+
+        for var in self.chart_series_vars.values():
+            var.set(False)
+
+        if group == CATEGORY_ALL:
+            if "总资产" in self.chart_series_vars:
+                self.chart_series_vars["总资产"].set(True)
+        else:
+            key = f"{group}合计"
+            if key in self.chart_series_vars:
+                self.chart_series_vars[key].set(True)
+            else:
+                for name, meta in self.chart_series_meta.items():
+                    if meta.get("category") == group:
+                        self.chart_series_vars[name].set(True)
+
+        self.on_chart_symbol_selection_changed()
+
     def on_chart_symbol_selection_changed(self):
-        available_symbols = [
-            symbol for symbol, var in self.chart_symbol_vars.items()
+        available = [
+            key for key, var in self.chart_series_vars.items()
             if var is not None
         ]
-        self.get_selected_chart_symbols(available_symbols)
+        self.get_selected_chart_series(available)
         if self.profit_chart_data:
             self.profit_chart_data = self.filter_profit_chart_data(self.profit_chart_data)
-            if self.highlighted_symbol not in self.profit_chart_data["series"]:
-                self.highlighted_symbol = None
+            if self.highlighted_series not in self.profit_chart_data["series"]:
+                self.highlighted_series = None
             self.draw_profit_chart()
         else:
             self.refresh_profit_chart()
@@ -927,10 +1212,11 @@ class PortfolioApp(tk.Tk):
         width = max(canvas.winfo_width(), 760)
         height = max(canvas.winfo_height(), 420)
         if not labels or not series:
-            if data.get("source") == "server":
-                empty_text = "暂无可绘制的服务端价格记录。请先启动服务端并等待价格采集。"
-            else:
-                empty_text = "暂无可绘制的历史持仓结果。请先在“持仓”页查询并保存。"
+            empty_text = (
+                "暂无可绘制的服务端价格记录。请先启动服务端并等待价格采集。"
+                if data.get("source") == "server"
+                else "暂无可绘制的历史持仓结果。请先在“持仓”页查询并保存。"
+            )
             canvas.create_text(
                 width / 2,
                 height / 2,
@@ -940,8 +1226,8 @@ class PortfolioApp(tk.Tk):
             )
             return
 
-        left = 48
-        right = 48
+        left = 58
+        right = 50
         top = 42
         bottom = 76
         chart_left = left
@@ -978,13 +1264,21 @@ class PortfolioApp(tk.Tk):
             value = min_value + (max_value - min_value) * step / 5
             y = y_for(value)
             canvas.create_line(chart_left, y, chart_right, y, fill="#eeeeee")
+            canvas.create_text(
+                chart_left - 8,
+                y,
+                text=self.format_chart_hover_value(value, metric),
+                anchor="e",
+                fill="#777777",
+                font=("Microsoft YaHei UI", 8),
+            )
 
         canvas.create_text(
             chart_left,
             18,
             text=(
-                f"不同币种{metric}走势"
-                + (f" - 已高亮 {self.highlighted_symbol}" if self.highlighted_symbol else "")
+                f"总资产与分类{metric}走势"
+                + (f" - 已高亮 {self.highlighted_series}" if self.highlighted_series else "")
             ),
             anchor="w",
             fill="#222222",
@@ -1011,12 +1305,11 @@ class PortfolioApp(tk.Tk):
             canvas.create_line(chart_left, y_zero, chart_right, y_zero, fill="#999999", dash=(4, 3))
 
         color_map = self.get_chart_color_map(data.get("all_series", series).keys())
-
         points_by_index = {index: [] for index in range(len(labels))}
-        for symbol, points in series.items():
-            selected = self.highlighted_symbol == symbol
-            dimmed = self.highlighted_symbol is not None and not selected
-            base_color = color_map.get(symbol, "#333333")
+        for name, points in series.items():
+            selected = self.highlighted_series == name
+            dimmed = self.highlighted_series is not None and not selected
+            base_color = color_map.get(name, "#333333")
             color = "#cfcfcf" if dimmed else base_color
             line_width = 4 if selected else 2
             marker_radius = 5 if selected else 3
@@ -1033,7 +1326,7 @@ class PortfolioApp(tk.Tk):
                     "y": y,
                 })
                 points_by_index.setdefault(index, []).append({
-                    "symbol": symbol,
+                    "name": name,
                     "value": value,
                     "x": x,
                     "y": y,
@@ -1049,7 +1342,7 @@ class PortfolioApp(tk.Tk):
                 )
             if len(coords) >= 4:
                 canvas.create_line(*coords, fill=color, width=line_width)
-            self.draw_chart_extreme_labels(canvas, symbol, screen_points, color, metric, chart_right)
+            self.draw_chart_extreme_labels(canvas, name, screen_points, color, metric, chart_right)
 
         self.profit_chart_layout = {
             "chart_left": chart_left,
@@ -1064,7 +1357,7 @@ class PortfolioApp(tk.Tk):
             "points_by_index": points_by_index,
         }
 
-    def draw_chart_extreme_labels(self, canvas, symbol, screen_points, color, metric, chart_right):
+    def draw_chart_extreme_labels(self, canvas, name, screen_points, color, metric, chart_right):
         if not screen_points:
             return
 
@@ -1077,15 +1370,14 @@ class PortfolioApp(tk.Tk):
 
         for label_kind, point in labels:
             label = (
-                f"{symbol} {label_kind} "
+                f"{name} {label_kind} "
                 f"{self.format_chart_hover_value(point['value'], metric)}"
             )
             anchor = "w"
             text_x = point["x"] + 8
-            if text_x > chart_right - 120:
+            if text_x > chart_right - 150:
                 anchor = "e"
                 text_x = point["x"] - 8
-
             canvas.create_text(
                 text_x,
                 point["y"],
@@ -1133,7 +1425,7 @@ class PortfolioApp(tk.Tk):
         points.sort(key=self.chart_hover_sort_key)
         metric = layout["metric"]
         rows = [
-            f"{point['symbol']}: {self.format_chart_hover_value(point['value'], metric)}"
+            f"{point['name']}: {self.format_chart_hover_value(point['value'], metric)}"
             for point in points
         ]
         title = layout["labels"][index]
@@ -1142,6 +1434,7 @@ class PortfolioApp(tk.Tk):
         padding_x = 10
         padding_y = 8
         box_width = max([len(title) * 8] + [len(row) * 8 for row in rows]) + padding_x * 2
+        box_width = min(box_width, 420)
         box_height = padding_y * 2 + line_height * (len(rows) + 1)
 
         box_x = mouse_x + 16
@@ -1193,11 +1486,11 @@ class PortfolioApp(tk.Tk):
 
         for row_index, point in enumerate(points, start=1):
             y = box_y + padding_y + line_height * row_index
-            selected = self.highlighted_symbol == point["symbol"]
+            selected = self.highlighted_series == point["name"]
             canvas.create_text(
                 box_x + padding_x,
                 y,
-                text=f"{point['symbol']}: {self.format_chart_hover_value(point['value'], metric)}",
+                text=f"{point['name']}: {self.format_chart_hover_value(point['value'], metric)}",
                 anchor="nw",
                 fill=point["color"],
                 font=("Microsoft YaHei UI", 9, "bold") if selected else ("Microsoft YaHei UI", 9),
@@ -1214,9 +1507,9 @@ class PortfolioApp(tk.Tk):
             )
 
     def chart_hover_sort_key(self, point):
-        if self.highlighted_symbol == point["symbol"]:
-            return (0, point["symbol"])
-        return (1, point["symbol"])
+        if self.highlighted_series == point["name"]:
+            return (0, point["name"])
+        return (1, point["name"])
 
     def format_chart_hover_value(self, value, metric):
         if metric == "收益率":
@@ -1227,29 +1520,32 @@ class PortfolioApp(tk.Tk):
         if hasattr(self, "profit_chart_canvas"):
             self.profit_chart_canvas.delete("chart_hover")
 
-    def toggle_chart_highlight(self, symbol):
-        if symbol in self.chart_symbol_vars and not self.chart_symbol_vars[symbol].get():
-            self.chart_symbol_vars[symbol].set(True)
+    def toggle_chart_highlight(self, name):
+        if name in self.chart_series_vars and not self.chart_series_vars[name].get():
+            self.chart_series_vars[name].set(True)
 
-        if self.highlighted_symbol == symbol:
-            self.highlighted_symbol = None
+        if self.highlighted_series == name:
+            self.highlighted_series = None
         else:
-            self.highlighted_symbol = symbol
+            self.highlighted_series = name
 
         if self.profit_chart_data:
             self.profit_chart_data = self.filter_profit_chart_data(self.profit_chart_data)
-            if self.highlighted_symbol not in self.profit_chart_data["series"]:
-                self.highlighted_symbol = None
+            if self.highlighted_series not in self.profit_chart_data["series"]:
+                self.highlighted_series = None
         self.draw_profit_chart()
 
     def clear_chart_highlight(self):
-        self.highlighted_symbol = None
+        self.highlighted_series = None
         if self.profit_chart_data:
             self.profit_chart_data = self.filter_profit_chart_data(self.profit_chart_data)
         self.draw_profit_chart()
 
     def parse_trade_form(self):
+        category = normalize_category(self.category_var.get())
+        market = normalize_market(self.current_form_market(), category)
         symbol = self.symbol_var.get().strip().upper()
+        name = self.name_var.get().strip()
         tx_type = "buy" if self.tx_type_var.get() == "买入" else "sell"
         try:
             amount = float(self.amount_var.get().strip())
@@ -1257,20 +1553,29 @@ class PortfolioApp(tk.Tk):
         except ValueError:
             messagebox.showerror("输入错误", "数量和价格必须是有效数字。")
             return None
+        fx_text = self.fx_var.get().strip()
+        fx_to_cny = None
+        if fx_text:
+            try:
+                fx_to_cny = float(fx_text)
+            except ValueError:
+                messagebox.showerror("输入错误", "汇率必须是有效数字，或留空自动获取。")
+                return None
 
         date = self.date_var.get().strip()
-        return symbol, tx_type, amount, price, date
+        return category, market, symbol, name, tx_type, amount, price, date, fx_to_cny
 
     def add_transaction(self):
         parsed = self.parse_trade_form()
         if parsed is None:
             return
 
-        symbol, tx_type, amount, price, date = parsed
+        category, market, symbol, name, tx_type, amount, price, date, fx_to_cny = parsed
         if tx_type == "buy":
-            saved = self.manager.buy(symbol, amount, price, date)
+            saved = self.manager.buy_asset(category, market, symbol, amount, price, date, name, fx_to_cny)
         else:
-            saved = self.manager.sell(symbol, amount, price, date)
+            asset_id = self.manager.find_asset_id(symbol, category, market)
+            saved = self.manager.sell_asset(asset_id, amount, price, date, fx_to_cny)
 
         if saved:
             self.after_data_change("交易已新增")
@@ -1286,13 +1591,22 @@ class PortfolioApp(tk.Tk):
         if parsed is None:
             return
 
-        old_symbol, old_index = self.selected_transaction
-        symbol, tx_type, amount, price, date = parsed
-        if symbol != old_symbol:
-            messagebox.showwarning("暂不支持", "编辑时不能修改币种。如需换币种，请删除后重新新增。")
+        asset_id, old_index = self.selected_transaction
+        asset = self.manager.data.get(asset_id)
+        if not asset:
+            messagebox.showwarning("提示", "选中的资产不存在。")
             return
 
-        if self.manager.update_transaction(old_symbol, old_index, tx_type, amount, price, date):
+        category, market, symbol, _name, tx_type, amount, price, date, fx_to_cny = parsed
+        if (
+            normalize_category(category) != asset["category"]
+            or normalize_market(market, category) != asset["market"]
+            or symbol.strip().upper() != asset["symbol"]
+        ):
+            messagebox.showwarning("暂不支持", "编辑时不能修改类别、市场或代码。如需更换资产，请删除后重新新增。")
+            return
+
+        if self.manager.update_transaction_by_asset(asset_id, old_index, tx_type, amount, price, date, fx_to_cny):
             self.after_data_change("交易已修改")
         else:
             messagebox.showwarning("未保存", "修改失败，请检查输入和后续卖出记录。")
@@ -1305,8 +1619,8 @@ class PortfolioApp(tk.Tk):
         if not messagebox.askyesno("确认删除", "确认删除选中的交易记录？"):
             return
 
-        symbol, index = self.selected_transaction
-        if self.manager.delete_transaction(symbol, index):
+        asset_id, index = self.selected_transaction
+        if self.manager.delete_transaction_by_asset(asset_id, index):
             self.clear_transaction_form()
             self.after_data_change("交易已删除")
         else:
@@ -1318,27 +1632,70 @@ class PortfolioApp(tk.Tk):
             return
 
         values = self.transactions_tree.item(selection[0], "values")
-        symbol, index, tx_type, date, amount, price, _total = values
-        self.selected_transaction = (symbol, int(index))
+        (
+            category, market_label, symbol, name, index, tx_type, date,
+            amount, price, currency, fx, _total_cny, asset_id,
+        ) = values
+        self.selected_transaction = (asset_id, int(index))
+        self.category_var.set(category)
+        self.update_form_market_options()
+        self.market_var.set(market_label)
         self.symbol_var.set(symbol)
+        self.name_var.set(name)
         self.tx_type_var.set(tx_type)
         self.date_var.set(date)
         self.amount_var.set(amount)
         self.price_var.set(price)
+        self.currency_var.set(currency)
+        self.fx_var.set(fx)
 
     def clear_transaction_form(self):
         self.selected_transaction = None
+        self.category_var.set(CATEGORY_CRYPTO)
+        self.update_form_market_options()
         self.symbol_var.set("")
+        self.name_var.set("")
         self.tx_type_var.set("买入")
         self.amount_var.set("")
         self.price_var.set("")
+        self.fx_var.set("")
         self.date_var.set(self.manager.now())
         self.transactions_tree.selection_remove(self.transactions_tree.selection())
 
     def after_data_change(self, message):
         self.refresh_symbols()
         self.refresh_transactions()
+        self.tx_summary_var.set("持仓已变化，点击“刷新收益”查看当前总资产收益")
+        self.profit_chart_data = None
         self.status_var.set(message)
+
+    def snapshot_rows_for_display(self, snapshot):
+        rows = snapshot.get("rows", [])
+        if not rows:
+            return []
+        if len(rows[0]) >= 13:
+            return rows
+
+        converted = []
+        for row in rows:
+            if len(row) < 7:
+                continue
+            converted.append([
+                CATEGORY_CRYPTO,
+                MARKET_LABELS[MARKET_CRYPTO],
+                row[0],
+                row[0],
+                row[1],
+                row[2],
+                row[3],
+                "USD",
+                "",
+                row[4],
+                "",
+                row[5],
+                row[6],
+            ])
+        return converted
 
     def on_snapshot_select(self, _event):
         selection = self.snapshots_tree.selection()
@@ -1354,7 +1711,7 @@ class PortfolioApp(tk.Tk):
             messagebox.showwarning("提示", "该快照文件不存在。")
             return
 
-        self.fill_tree(self.snapshot_detail_tree, snapshot.get("rows", []), self.rate_tag_for_row)
+        self.fill_tree(self.snapshot_detail_tree, self.snapshot_rows_for_display(snapshot), self.rate_tag_for_row)
         self.snapshot_summary_var.set(self.format_snapshot_summary(snapshot))
 
     def delete_selected_snapshot(self):

@@ -3,18 +3,24 @@ import json
 import sqlite3
 import threading
 from contextlib import closing
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from crypto_portfolio.market_data import (
+    CATEGORY_CRYPTO,
+    MARKET_CRYPTO,
+    asset_id_for,
+    fetch_quotes_for_assets,
+    normalize_category,
+    normalize_symbol,
+)
 from crypto_portfolio.portfolio_manager import PortfolioManager
 
 
 DEFAULT_CONFIG_PATH = "server_config.ini"
-COLLECT_RETRY_COUNT = 3
 
 
 @dataclass
@@ -68,6 +74,31 @@ class PriceHistoryStore:
                 CREATE INDEX IF NOT EXISTS idx_price_history_symbol_time
                 ON price_history(symbol, fetched_at)
             """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS asset_price_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    asset_id TEXT NOT NULL,
+                    category TEXT NOT NULL,
+                    market TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    currency TEXT NOT NULL,
+                    price REAL NOT NULL,
+                    fx_to_cny REAL NOT NULL,
+                    price_cny REAL NOT NULL,
+                    source TEXT NOT NULL,
+                    fetched_at TEXT NOT NULL,
+                    UNIQUE(asset_id, fetched_at)
+                )
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_asset_price_history_asset_time
+                ON asset_price_history(asset_id, fetched_at)
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_asset_price_history_category_time
+                ON asset_price_history(category, fetched_at)
+            """)
             conn.commit()
 
     def save_prices(self, prices, sources, fetched_at):
@@ -82,6 +113,38 @@ class PriceHistoryStore:
             conn.executemany("""
                 INSERT OR REPLACE INTO price_history(symbol, price, source, fetched_at)
                 VALUES (?, ?, ?, ?)
+            """, rows)
+            conn.commit()
+        return len(rows)
+
+    def save_asset_quotes(self, quotes, assets_by_id, fetched_at):
+        if not quotes:
+            return 0
+
+        rows = []
+        for asset_id, quote in quotes.items():
+            asset = assets_by_id.get(asset_id, {})
+            rows.append((
+                asset_id,
+                quote.get("category") or asset.get("category", ""),
+                quote.get("market") or asset.get("market", ""),
+                quote.get("symbol") or asset.get("symbol", ""),
+                quote.get("name") or asset.get("name") or quote.get("symbol") or "",
+                quote.get("currency") or asset.get("currency", ""),
+                float(quote["price"]),
+                float(quote.get("fx_to_cny", 1.0)),
+                float(quote.get("price_cny", quote["price"])),
+                quote.get("source", "unknown"),
+                fetched_at,
+            ))
+
+        with closing(self.connect()) as conn:
+            conn.executemany("""
+                INSERT OR REPLACE INTO asset_price_history(
+                    asset_id, category, market, symbol, name, currency,
+                    price, fx_to_cny, price_cny, source, fetched_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, rows)
             conn.commit()
         return len(rows)
@@ -107,6 +170,28 @@ class PriceHistoryStore:
                         "source": row["source"],
                         "fetched_at": row["fetched_at"],
                     }
+        return latest
+
+    def latest_asset_prices(self, asset_ids=None, categories=None):
+        filters, params = self.asset_filters(asset_ids, categories)
+        where = f"WHERE {' AND '.join(filters)}" if filters else ""
+        query = f"""
+            SELECT aph.*
+            FROM asset_price_history aph
+            JOIN (
+                SELECT asset_id, MAX(fetched_at) AS latest_at
+                FROM asset_price_history
+                {where}
+                GROUP BY asset_id
+            ) latest
+            ON aph.asset_id = latest.asset_id AND aph.fetched_at = latest.latest_at
+            ORDER BY aph.category ASC, aph.market ASC, aph.symbol ASC
+        """
+        latest = {}
+        with closing(self.connect()) as conn:
+            conn.row_factory = sqlite3.Row
+            for row in conn.execute(query, params):
+                latest[row["asset_id"]] = self.asset_row_to_payload(row)
         return latest
 
     def history(self, symbols, start=None, end=None, limit=2000):
@@ -138,12 +223,93 @@ class PriceHistoryStore:
             for row in conn.execute(query, params):
                 point = points_by_time.setdefault(
                     row["fetched_at"],
-                    {"timestamp": row["fetched_at"], "prices": {}, "sources": {}}
+                    {"timestamp": row["fetched_at"], "prices": {}, "sources": {}},
                 )
                 point["prices"][row["symbol"]] = row["price"]
                 point["sources"][row["symbol"]] = row["source"]
 
         return list(points_by_time.values())
+
+    def asset_history(self, asset_ids=None, categories=None, start=None, end=None, limit=5000):
+        filters, params = self.asset_filters(asset_ids, categories)
+        if start:
+            filters.append("fetched_at >= ?")
+            params.append(start)
+        if end:
+            filters.append("fetched_at <= ?")
+            params.append(end)
+        params.append(limit)
+
+        where = f"WHERE {' AND '.join(filters)}" if filters else ""
+        query = f"""
+            SELECT *
+            FROM asset_price_history
+            {where}
+            ORDER BY fetched_at ASC, asset_id ASC
+            LIMIT ?
+        """
+
+        assets = {}
+        points_by_time = {}
+        with closing(self.connect()) as conn:
+            conn.row_factory = sqlite3.Row
+            for row in conn.execute(query, params):
+                payload = self.asset_row_to_payload(row)
+                assets[row["asset_id"]] = {
+                    "asset_id": row["asset_id"],
+                    "category": row["category"],
+                    "market": row["market"],
+                    "symbol": row["symbol"],
+                    "name": row["name"],
+                    "currency": row["currency"],
+                }
+                point = points_by_time.setdefault(
+                    row["fetched_at"],
+                    {
+                        "timestamp": row["fetched_at"],
+                        "prices": {},
+                        "price_cny": {},
+                        "fx_to_cny": {},
+                        "sources": {},
+                    },
+                )
+                point["prices"][row["asset_id"]] = row["price"]
+                point["price_cny"][row["asset_id"]] = row["price_cny"]
+                point["fx_to_cny"][row["asset_id"]] = row["fx_to_cny"]
+                point["sources"][row["asset_id"]] = row["source"]
+
+        return {
+            "assets": assets,
+            "points": list(points_by_time.values()),
+        }
+
+    def asset_filters(self, asset_ids=None, categories=None):
+        filters = []
+        params = []
+        if asset_ids:
+            placeholders = ",".join("?" for _ in asset_ids)
+            filters.append(f"asset_id IN ({placeholders})")
+            params.extend(asset_ids)
+        if categories:
+            placeholders = ",".join("?" for _ in categories)
+            filters.append(f"category IN ({placeholders})")
+            params.extend(categories)
+        return filters, params
+
+    def asset_row_to_payload(self, row):
+        return {
+            "asset_id": row["asset_id"],
+            "category": row["category"],
+            "market": row["market"],
+            "symbol": row["symbol"],
+            "name": row["name"],
+            "currency": row["currency"],
+            "price": row["price"],
+            "fx_to_cny": row["fx_to_cny"],
+            "price_cny": row["price_cny"],
+            "source": row["source"],
+            "fetched_at": row["fetched_at"],
+        }
 
 
 class PriceCollector:
@@ -151,64 +317,81 @@ class PriceCollector:
         self.config_path = config_path
         self.stop_event = threading.Event()
 
+    def configured_crypto_assets(self, config):
+        assets = []
+        for symbol in config.symbols:
+            symbol = normalize_symbol(symbol, CATEGORY_CRYPTO, MARKET_CRYPTO)
+            assets.append({
+                "asset_id": asset_id_for(CATEGORY_CRYPTO, MARKET_CRYPTO, symbol),
+                "category": CATEGORY_CRYPTO,
+                "market": MARKET_CRYPTO,
+                "symbol": symbol,
+                "name": symbol,
+                "currency": "USD",
+                "quantity": 1.0,
+            })
+        return assets
+
+    def collect_assets(self, config):
+        manager = PortfolioManager()
+        assets = manager.get_active_assets()
+        return assets or self.configured_crypto_assets(config)
+
     def fetch_once(self):
         config = load_config(self.config_path)
-        expected_symbols = normalize_symbols(config.symbols)
-        if not expected_symbols:
+        assets = self.collect_assets(config)
+        fetched_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        if not assets:
             return {
                 "status": "skipped",
-                "reason": "no_symbols",
-                "attempts": 0,
-                "fetched_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "saved_count": 0,
-                "missing_symbols": [],
-                "prices": {},
-                "sources": {},
-            }
-
-        last_prices = {}
-        last_sources = {}
-        last_missing_symbols = expected_symbols
-
-        for attempt in range(1, COLLECT_RETRY_COUNT + 1):
-            fetched_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            prices, sources = fetch_prices(expected_symbols)
-            missing_symbols = find_missing_symbols(expected_symbols, prices, sources)
-            last_prices = prices
-            last_sources = sources
-            last_missing_symbols = missing_symbols
-
-            if missing_symbols:
-                print(
-                    f"{fetched_at} 第 {attempt}/{COLLECT_RETRY_COUNT} 次采集不完整，"
-                    f"缺失: {', '.join(missing_symbols)}"
-                )
-                continue
-
-            # Only complete batches are written. Partial attempt data stays in
-            # local variables and is discarded if the retry budget is exhausted.
-            store = PriceHistoryStore(config.database)
-            saved_count = store.save_prices(prices, sources, fetched_at)
-            return {
-                "status": "saved",
-                "attempts": attempt,
+                "reason": "no_assets",
                 "fetched_at": fetched_at,
-                "saved_count": saved_count,
-                "missing_symbols": [],
-                "prices": prices,
-                "sources": sources,
+                "saved_count": 0,
+                "missing_assets": [],
+                "prices": {},
+                "assets": {},
             }
 
-        fetched_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        quotes, errors = fetch_quotes_for_assets(assets, max_workers=24)
+        assets_by_id = {asset["asset_id"]: asset for asset in assets}
+        store = PriceHistoryStore(config.database)
+        saved_count = store.save_asset_quotes(quotes, assets_by_id, fetched_at)
+
+        crypto_prices = {}
+        crypto_sources = {}
+        for asset_id, quote in quotes.items():
+            if quote.get("category") != CATEGORY_CRYPTO:
+                continue
+            symbol = quote.get("symbol")
+            crypto_prices[symbol] = quote["price"]
+            crypto_sources[symbol] = quote.get("source", "unknown")
+        store.save_prices(crypto_prices, crypto_sources, fetched_at)
+
+        status = "saved" if saved_count == len(assets) else "partial"
+        if saved_count == 0:
+            status = "skipped"
+
         return {
-            "status": "skipped",
-            "reason": "incomplete_prices",
-            "attempts": COLLECT_RETRY_COUNT,
+            "status": status,
             "fetched_at": fetched_at,
-            "saved_count": 0,
-            "missing_symbols": last_missing_symbols,
-            "prices": last_prices,
-            "sources": last_sources,
+            "saved_count": saved_count,
+            "missing_assets": sorted(errors),
+            "errors": errors,
+            "prices": {
+                asset_id: quote["price"]
+                for asset_id, quote in quotes.items()
+            },
+            "assets": {
+                asset_id: {
+                    "category": quote.get("category"),
+                    "market": quote.get("market"),
+                    "symbol": quote.get("symbol"),
+                    "name": quote.get("name"),
+                    "currency": quote.get("currency"),
+                    "price_cny": quote.get("price_cny"),
+                }
+                for asset_id, quote in quotes.items()
+            },
         }
 
     def start(self):
@@ -223,15 +406,9 @@ class PriceCollector:
         while not self.stop_event.is_set():
             try:
                 result = self.fetch_once()
-                if result.get("status") == "saved":
-                    print(
-                        f"{result['fetched_at']} 已保存 {result['saved_count']} 条价格，"
-                        f"尝试 {result.get('attempts', 1)} 次。"
-                    )
-                else:
-                    missing = result.get("missing_symbols", [])
-                    missing_text = f"，缺失: {', '.join(missing)}" if missing else ""
-                    print(f"{result['fetched_at']} 本轮价格采集跳过{missing_text}。")
+                missing = result.get("missing_assets", [])
+                missing_text = f"，缺失 {len(missing)} 个资产" if missing else ""
+                print(f"{result['fetched_at']} 价格采集 {result['status']}，保存 {result['saved_count']} 条{missing_text}。")
             except Exception as exc:
                 print(f"价格采集失败: {exc}")
 
@@ -244,72 +421,48 @@ def normalize_symbols(symbols):
     return [symbol.strip().upper() for symbol in symbols if symbol.strip()]
 
 
-def find_missing_symbols(expected_symbols, prices, sources):
-    return [
-        symbol for symbol in expected_symbols
-        if symbol not in prices or symbol not in sources
-    ]
-
-
 def fetch_prices(symbols):
     symbols = normalize_symbols(symbols)
     if not symbols:
         return {}, {}
 
-    manager = PortfolioManager()
+    assets = [
+        {
+            "asset_id": asset_id_for(CATEGORY_CRYPTO, MARKET_CRYPTO, symbol),
+            "category": CATEGORY_CRYPTO,
+            "market": MARKET_CRYPTO,
+            "symbol": symbol,
+            "name": symbol,
+            "currency": "USD",
+        }
+        for symbol in symbols
+    ]
+    quotes, _errors = fetch_quotes_for_assets(assets)
     prices = {}
     sources = {}
-    futures_by_symbol = {symbol: [] for symbol in symbols}
-    future_meta = {}
-    executor = ThreadPoolExecutor(max_workers=min(len(symbols) * 3, 24))
-
-    try:
-        for symbol in symbols:
-            tasks = [
-                ("OKX", manager.fetch_okx_price),
-                ("Binance", manager.fetch_binance_price),
-                ("CoinGecko", manager.fetch_coingecko_price),
-            ]
-            for source, fetch_price in tasks:
-                future = executor.submit(fetch_price, symbol)
-                futures_by_symbol[symbol].append(future)
-                future_meta[future] = (symbol, source)
-
-        resolved_symbols = set()
-        for future in as_completed(future_meta):
-            symbol, source = future_meta[future]
-            if symbol in resolved_symbols:
-                continue
-
-            try:
-                price = future.result()
-            except Exception:
-                continue
-
-            if price is None:
-                continue
-
-            prices[symbol] = price
-            sources[symbol] = source
-            resolved_symbols.add(symbol)
-
-            for other_future in futures_by_symbol[symbol]:
-                if other_future is not future:
-                    other_future.cancel()
-
-            if len(resolved_symbols) == len(symbols):
-                break
-    finally:
-        executor.shutdown(wait=False, cancel_futures=True)
-
+    for quote in quotes.values():
+        prices[quote["symbol"]] = quote["price"]
+        sources[quote["symbol"]] = quote.get("source", "unknown")
     return prices, sources
 
 
+def parse_csv(query, key):
+    raw = query.get(key, [""])[0]
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
 def parse_symbols(query, default_symbols):
-    raw_symbols = query.get("symbols", [""])[0]
-    if not raw_symbols:
-        return default_symbols
-    return [symbol.strip().upper() for symbol in raw_symbols.split(",") if symbol.strip()]
+    symbols = parse_csv(query, "symbols")
+    return [symbol.upper() for symbol in symbols] if symbols else default_symbols
+
+
+def parse_asset_ids(query):
+    return parse_csv(query, "asset_ids")
+
+
+def parse_categories(query):
+    values = parse_csv(query, "categories") or parse_csv(query, "category")
+    return [normalize_category(value) for value in values]
 
 
 def make_handler(config_path, collector):
@@ -328,7 +481,12 @@ def make_handler(config_path, collector):
             store = PriceHistoryStore(config.database)
 
             if parsed.path == "/api/health":
-                self.send_json({"status": "ok", "symbols": config.symbols})
+                manager = PortfolioManager()
+                self.send_json({
+                    "status": "ok",
+                    "symbols": config.symbols,
+                    "asset_count": len(manager.get_active_assets()),
+                })
                 return
 
             if parsed.path == "/api/symbols":
@@ -350,6 +508,27 @@ def make_handler(config_path, collector):
                     limit=limit,
                 )
                 self.send_json({"symbols": symbols, "points": points})
+                return
+
+            if parsed.path == "/api/assets/latest":
+                self.send_json({
+                    "prices": store.latest_asset_prices(
+                        asset_ids=parse_asset_ids(query),
+                        categories=parse_categories(query),
+                    )
+                })
+                return
+
+            if parsed.path == "/api/assets/history":
+                limit = int(query.get("limit", ["5000"])[0])
+                payload = store.asset_history(
+                    asset_ids=parse_asset_ids(query),
+                    categories=parse_categories(query),
+                    start=query.get("start", [None])[0],
+                    end=query.get("end", [None])[0],
+                    limit=limit,
+                )
+                self.send_json(payload)
                 return
 
             self.send_json({"error": "not found"}, status=404)
@@ -399,7 +578,7 @@ def run_server(config_path=DEFAULT_CONFIG_PATH):
 
     server = ThreadingHTTPServer(
         (config.host, config.port),
-        make_handler(config_path, collector)
+        make_handler(config_path, collector),
     )
     print(f"价格服务已启动: http://{config.host}:{config.port}")
     print(f"配置文件: {config_path}")
