@@ -51,7 +51,7 @@ crypto_price_server.py           # 价格采集服务端入口
 start_gui.bat                    # 双击启动图形界面
 start_cli.bat                    # 双击启动命令行界面
 start_server.bat                 # 双击启动价格服务端
-server_config.ini                # 服务端配置，包含币种和采集间隔
+server_config.ini                # 服务端配置，包含币种、采集间隔和日志等级
 crypto_portfolio/                # 应用代码
   __init__.py
   cli.py                         # 命令行菜单和用户输入，默认处理加密货币
@@ -66,6 +66,15 @@ holding_snapshots/               # 持仓查询结果快照，不提交到仓库
 price_history.sqlite3            # 服务端价格历史数据库，不提交到仓库
 okx_credentials.json             # 本地凭据，不提交到仓库
 ```
+
+服务端排错时可以把 `server_config.ini` 的日志等级调成：
+
+```ini
+[logging]
+level = DEBUG
+```
+
+`DEBUG` 会打印每次接口返回给客户端的数据，排错完成后建议改回 `INFO`。
 
 ## 价格服务端接口
 
