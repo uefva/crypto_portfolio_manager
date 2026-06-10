@@ -1,4 +1,14 @@
 #!/usr/bin/env bash
+
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+  ENTRY_FILE="${ENTRY_FILE-}" \
+  PYTHON_BIN="${PYTHON_BIN-}" \
+  LOG_FILE="${LOG_FILE-}" \
+  PID_FILE="${PID_FILE-}" \
+  bash "${BASH_SOURCE[0]}"
+  return $?
+fi
+
 set -euo pipefail
 
 APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
