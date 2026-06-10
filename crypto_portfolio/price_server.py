@@ -11,13 +11,20 @@ from urllib.parse import parse_qs, urlparse
 
 from crypto_portfolio.market_data import (
     CATEGORY_CRYPTO,
+    CATEGORY_FUND,
+    CATEGORY_STOCK,
     MARKET_CRYPTO,
+    MARKET_FUND,
+    MARKET_HK,
+    MARKET_SH,
+    MARKET_SZ,
+    MARKET_US,
     asset_id_for,
+    currency_for,
     fetch_quotes_for_assets,
     normalize_category,
     normalize_symbol,
 )
-from crypto_portfolio.portfolio_manager import PortfolioManager
 
 
 DEFAULT_CONFIG_PATH = "server_config.ini"
@@ -28,22 +35,90 @@ class ServerConfig:
     host: str
     port: int
     symbols: list[str]
+    assets: list[dict]
+    enabled_categories: dict
+    asset_counts: dict
     interval_minutes: int
     database: str
     log_level: str
+
+
+def parse_config_list(value):
+    return [item.strip() for item in str(value or "").split(",") if item.strip()]
+
+
+def read_csv(parser, section, option, fallback=""):
+    return parse_config_list(parser.get(section, option, fallback=fallback))
+
+
+def make_config_asset(category, market, symbol):
+    symbol = normalize_symbol(symbol, category, market)
+    return {
+        "asset_id": asset_id_for(category, market, symbol),
+        "category": category,
+        "market": market,
+        "symbol": symbol,
+        "name": symbol,
+        "currency": currency_for(category, market),
+        "quantity": 1.0,
+    }
 
 
 def load_config(config_path=DEFAULT_CONFIG_PATH):
     parser = configparser.ConfigParser()
     parser.read(config_path, encoding="utf-8")
 
-    symbols = parser.get("prices", "symbols", fallback="BTC,ETH").split(",")
-    symbols = [symbol.strip().upper() for symbol in symbols if symbol.strip()]
+    legacy_symbols = parser.get("prices", "symbols", fallback="BTC,ETH")
+    crypto_enabled = parser.getboolean("crypto", "enabled", fallback=True)
+    fund_enabled = parser.getboolean("fund", "enabled", fallback=False)
+    stock_enabled = parser.getboolean("stock", "enabled", fallback=False)
+
+    crypto_symbols = read_csv(parser, "crypto", "symbols", fallback=legacy_symbols)
+    crypto_symbols = [normalize_symbol(symbol, CATEGORY_CRYPTO, MARKET_CRYPTO) for symbol in crypto_symbols]
+
+    fund_codes = read_csv(parser, "fund", "codes", fallback="")
+    stock_symbols = {
+        MARKET_US: read_csv(parser, "stock", "us", fallback=""),
+        MARKET_HK: read_csv(parser, "stock", "hk", fallback=""),
+        MARKET_SH: read_csv(parser, "stock", "sh", fallback=""),
+        MARKET_SZ: read_csv(parser, "stock", "sz", fallback=""),
+    }
+
+    assets = []
+    if crypto_enabled:
+        assets.extend(
+            make_config_asset(CATEGORY_CRYPTO, MARKET_CRYPTO, symbol)
+            for symbol in crypto_symbols
+        )
+    if fund_enabled:
+        assets.extend(
+            make_config_asset(CATEGORY_FUND, MARKET_FUND, code)
+            for code in fund_codes
+        )
+    if stock_enabled:
+        for market, symbols in stock_symbols.items():
+            assets.extend(
+                make_config_asset(CATEGORY_STOCK, market, symbol)
+                for symbol in symbols
+            )
+
+    asset_counts = {
+        CATEGORY_CRYPTO: sum(1 for asset in assets if asset["category"] == CATEGORY_CRYPTO),
+        CATEGORY_FUND: sum(1 for asset in assets if asset["category"] == CATEGORY_FUND),
+        CATEGORY_STOCK: sum(1 for asset in assets if asset["category"] == CATEGORY_STOCK),
+    }
 
     return ServerConfig(
         host=parser.get("server", "host", fallback="127.0.0.1"),
         port=parser.getint("server", "port", fallback=8765),
-        symbols=symbols,
+        symbols=crypto_symbols,
+        assets=assets,
+        enabled_categories={
+            CATEGORY_CRYPTO: crypto_enabled,
+            CATEGORY_FUND: fund_enabled,
+            CATEGORY_STOCK: stock_enabled,
+        },
+        asset_counts=asset_counts,
         interval_minutes=parser.getint("prices", "interval_minutes", fallback=30),
         database=parser.get("prices", "database", fallback="price_history.sqlite3"),
         log_level=parser.get("logging", "level", fallback="INFO").strip().upper(),
@@ -330,25 +405,8 @@ class PriceCollector:
         self.config_path = config_path
         self.stop_event = threading.Event()
 
-    def configured_crypto_assets(self, config):
-        assets = []
-        for symbol in config.symbols:
-            symbol = normalize_symbol(symbol, CATEGORY_CRYPTO, MARKET_CRYPTO)
-            assets.append({
-                "asset_id": asset_id_for(CATEGORY_CRYPTO, MARKET_CRYPTO, symbol),
-                "category": CATEGORY_CRYPTO,
-                "market": MARKET_CRYPTO,
-                "symbol": symbol,
-                "name": symbol,
-                "currency": "USD",
-                "quantity": 1.0,
-            })
-        return assets
-
     def collect_assets(self, config):
-        manager = PortfolioManager()
-        assets = manager.get_active_assets()
-        return assets or self.configured_crypto_assets(config)
+        return list(config.assets)
 
     def fetch_once(self):
         config = load_config(self.config_path)
@@ -494,11 +552,12 @@ def make_handler(config_path, collector):
             store = PriceHistoryStore(config.database)
 
             if parsed.path == "/api/health":
-                manager = PortfolioManager()
                 self.send_json({
                     "status": "ok",
                     "symbols": config.symbols,
-                    "asset_count": len(manager.get_active_assets()),
+                    "asset_count": len(config.assets),
+                    "enabled_categories": config.enabled_categories,
+                    "asset_counts": config.asset_counts,
                 })
                 return
 

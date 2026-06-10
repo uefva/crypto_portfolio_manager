@@ -1,12 +1,29 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from crypto_portfolio.market_data import CATEGORY_STOCK, MARKET_US, asset_id_for
-from crypto_portfolio.price_server import PriceHistoryStore
+from crypto_portfolio.market_data import (
+    CATEGORY_CRYPTO,
+    CATEGORY_FUND,
+    CATEGORY_STOCK,
+    MARKET_CRYPTO,
+    MARKET_FUND,
+    MARKET_HK,
+    MARKET_SH,
+    MARKET_SZ,
+    MARKET_US,
+    asset_id_for,
+)
+from crypto_portfolio.price_server import PriceCollector, PriceHistoryStore, load_config
 
 
 class PriceHistoryStoreTest(unittest.TestCase):
+    def write_config(self, tmpdir, content):
+        path = Path(tmpdir) / "server_config.ini"
+        path.write_text(content, encoding="utf-8")
+        return path
+
     def test_asset_latest_and_history_round_trip(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             store = PriceHistoryStore(str(Path(tmpdir) / "prices.sqlite3"))
@@ -41,6 +58,170 @@ class PriceHistoryStoreTest(unittest.TestCase):
             history = store.asset_history(asset_ids=[asset_id])
             self.assertEqual(history["assets"][asset_id]["symbol"], "QQQM")
             self.assertEqual(history["points"][0]["price_cny"][asset_id], 710.0)
+
+    def test_load_config_builds_assets_from_enabled_sections(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = self.write_config(tmpdir, """
+[server]
+host = 127.0.0.1
+port = 8765
+
+[prices]
+interval_minutes = 30
+database = price_history.sqlite3
+
+[crypto]
+enabled = true
+symbols = BTC,ETH
+
+[fund]
+enabled = true
+codes = 270042
+
+[stock]
+enabled = true
+us = QQQM
+hk = 00700
+sh = 600519
+sz = 000001
+""")
+
+            config = load_config(str(config_path))
+            asset_ids = {asset["asset_id"] for asset in config.assets}
+
+            self.assertEqual(config.symbols, ["BTC", "ETH"])
+            self.assertIn(asset_id_for(CATEGORY_CRYPTO, MARKET_CRYPTO, "BTC"), asset_ids)
+            self.assertIn(asset_id_for(CATEGORY_FUND, MARKET_FUND, "270042"), asset_ids)
+            self.assertIn(asset_id_for(CATEGORY_STOCK, MARKET_US, "QQQM"), asset_ids)
+            self.assertIn(asset_id_for(CATEGORY_STOCK, MARKET_HK, "00700"), asset_ids)
+            self.assertIn(asset_id_for(CATEGORY_STOCK, MARKET_SH, "600519"), asset_ids)
+            self.assertIn(asset_id_for(CATEGORY_STOCK, MARKET_SZ, "000001"), asset_ids)
+            self.assertEqual(config.asset_counts[CATEGORY_CRYPTO], 2)
+            self.assertEqual(config.asset_counts[CATEGORY_FUND], 1)
+            self.assertEqual(config.asset_counts[CATEGORY_STOCK], 4)
+
+    def test_disabled_categories_do_not_enter_collection_list(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = self.write_config(tmpdir, """
+[prices]
+interval_minutes = 30
+database = price_history.sqlite3
+
+[crypto]
+enabled = false
+symbols = BTC
+
+[fund]
+enabled = false
+codes = 270042
+
+[stock]
+enabled = true
+us = QQQM
+""")
+
+            config = load_config(str(config_path))
+            asset_ids = {asset["asset_id"] for asset in config.assets}
+
+            self.assertNotIn(asset_id_for(CATEGORY_CRYPTO, MARKET_CRYPTO, "BTC"), asset_ids)
+            self.assertNotIn(asset_id_for(CATEGORY_FUND, MARKET_FUND, "270042"), asset_ids)
+            self.assertIn(asset_id_for(CATEGORY_STOCK, MARKET_US, "QQQM"), asset_ids)
+            self.assertFalse(config.enabled_categories[CATEGORY_CRYPTO])
+            self.assertFalse(config.enabled_categories[CATEGORY_FUND])
+
+    def test_legacy_prices_symbols_fallback_to_crypto_config(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = self.write_config(tmpdir, """
+[prices]
+symbols = BTC,ETH
+interval_minutes = 30
+database = price_history.sqlite3
+""")
+
+            config = load_config(str(config_path))
+            asset_ids = {asset["asset_id"] for asset in config.assets}
+
+            self.assertEqual(config.symbols, ["BTC", "ETH"])
+            self.assertIn(asset_id_for(CATEGORY_CRYPTO, MARKET_CRYPTO, "BTC"), asset_ids)
+            self.assertIn(asset_id_for(CATEGORY_CRYPTO, MARKET_CRYPTO, "ETH"), asset_ids)
+            self.assertEqual(config.asset_counts[CATEGORY_CRYPTO], 2)
+            self.assertEqual(config.asset_counts[CATEGORY_FUND], 0)
+            self.assertEqual(config.asset_counts[CATEGORY_STOCK], 0)
+
+    def test_refresh_collects_configured_assets(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            database = Path(tmpdir) / "prices.sqlite3"
+            config_path = self.write_config(tmpdir, f"""
+[prices]
+interval_minutes = 30
+database = {database}
+
+[crypto]
+enabled = false
+symbols = BTC
+
+[fund]
+enabled = true
+codes = 270042
+
+[stock]
+enabled = true
+us = QQQM
+""")
+            fund_id = asset_id_for(CATEGORY_FUND, MARKET_FUND, "270042")
+            stock_id = asset_id_for(CATEGORY_STOCK, MARKET_US, "QQQM")
+
+            def fake_fetch(assets, max_workers=16):
+                quotes = {}
+                for asset in assets:
+                    quotes[asset["asset_id"]] = {
+                        "category": asset["category"],
+                        "market": asset["market"],
+                        "symbol": asset["symbol"],
+                        "name": asset["symbol"],
+                        "currency": asset["currency"],
+                        "price": 100.0,
+                        "fx_to_cny": 1.0,
+                        "price_cny": 100.0,
+                        "source": "test",
+                    }
+                return quotes, {}
+
+            with patch("crypto_portfolio.price_server.fetch_quotes_for_assets", fake_fetch):
+                result = PriceCollector(str(config_path)).fetch_once()
+
+            self.assertEqual(result["status"], "saved")
+            self.assertEqual(result["saved_count"], 2)
+            self.assertIn(fund_id, result["assets"])
+            self.assertIn(stock_id, result["assets"])
+
+            history = PriceHistoryStore(str(database)).asset_history(asset_ids=[fund_id, stock_id])
+            self.assertEqual(set(history["assets"]), {fund_id, stock_id})
+
+    def test_refresh_skips_when_all_categories_disabled(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = self.write_config(tmpdir, """
+[prices]
+interval_minutes = 30
+database = price_history.sqlite3
+
+[crypto]
+enabled = false
+symbols = BTC
+
+[fund]
+enabled = false
+codes = 270042
+
+[stock]
+enabled = false
+us = QQQM
+""")
+
+            result = PriceCollector(str(config_path)).fetch_once()
+            self.assertEqual(result["status"], "skipped")
+            self.assertEqual(result["reason"], "no_assets")
+            self.assertEqual(result["saved_count"], 0)
 
 
 if __name__ == "__main__":

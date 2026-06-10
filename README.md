@@ -51,7 +51,7 @@ crypto_price_server.py           # 价格采集服务端入口
 start_gui.bat                    # 双击启动图形界面
 start_cli.bat                    # 双击启动命令行界面
 start_server.bat                 # 双击启动价格服务端
-server_config.ini                # 服务端配置，包含币种、采集间隔和日志等级
+server_config.ini                # 服务端配置，包含采集资产、采集间隔和日志等级
 crypto_portfolio/                # 应用代码
   __init__.py
   cli.py                         # 命令行菜单和用户输入，默认处理加密货币
@@ -66,6 +66,31 @@ holding_snapshots/               # 持仓查询结果快照，不提交到仓库
 price_history.sqlite3            # 服务端价格历史数据库，不提交到仓库
 okx_credentials.json             # 本地凭据，不提交到仓库
 ```
+
+价格服务端只按照 `server_config.ini` 采集资产，不读取服务器本机的 `portfolio.json`。要让服务器采集股票或基金，请在配置文件中维护采集列表：
+
+```ini
+[prices]
+interval_minutes = 30
+database = price_history.sqlite3
+
+[crypto]
+enabled = true
+symbols = BTC,ETH,ADA,SOL,SUI,PEPE,DOGE
+
+[fund]
+enabled = true
+codes = 270042,017437,009478
+
+[stock]
+enabled = true
+us = QQQM,BABA
+hk = 00700
+sh = 600519
+sz = 000001
+```
+
+每个分类都可以用 `enabled = false` 单独关闭采集。GUI 的“服务端价格记录”仍会按本地持仓请求历史数据；只有该资产也出现在服务器配置里并被采集过，走势图才会有数据。
 
 服务端排错时可以把 `server_config.ini` 的日志等级调成：
 
