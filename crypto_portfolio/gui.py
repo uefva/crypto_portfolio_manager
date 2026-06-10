@@ -68,7 +68,7 @@ class PortfolioApp(tk.Tk):
         self.fx_var = tk.StringVar()
         self.date_var = tk.StringVar(value=self.manager.now())
 
-        self.chart_source_var = tk.StringVar(value="历史仓位结果")
+        self.chart_source_var = tk.StringVar(value="服务端价格记录")
         self.chart_metric_var = tk.StringVar(value="收益金额")
         self.chart_range_var = tk.StringVar(value="全部时间")
         self.server_url_var = tk.StringVar(value="http://687pq84al732.vicp.fun:47649")
@@ -775,18 +775,30 @@ class PortfolioApp(tk.Tk):
         if self.chart_source_var.get() == "服务端价格记录":
             self.run_background(
                 self.build_server_profit_chart_data,
-                self.apply_profit_chart_data,
+                self.apply_server_profit_chart_data,
                 "正在从服务端读取价格历史...",
             )
             return
 
         self.apply_profit_chart_data(self.build_profit_chart_data())
+        self.status_var.set("已使用历史持仓结果更新收益走势")
 
     def apply_profit_chart_data(self, data):
         self.profit_chart_data = self.filter_profit_chart_data(data)
         if self.highlighted_series not in self.profit_chart_data["series"]:
             self.highlighted_series = None
         self.draw_profit_chart()
+
+    def apply_server_profit_chart_data(self, data):
+        self.apply_profit_chart_data(data)
+        point_count = len(data.get("labels", []))
+        series_count = len(data.get("series", {}))
+        if point_count == 0 or series_count == 0:
+            self.status_var.set("服务端价格历史读取成功，但暂无可绘制数据")
+        else:
+            self.status_var.set(
+                f"服务端价格历史读取成功：{point_count} 个时间点，{series_count} 条曲线"
+            )
 
     def series_value(self, profit, cost, metric):
         if metric == "收益率":
@@ -1312,7 +1324,6 @@ class PortfolioApp(tk.Tk):
             base_color = color_map.get(name, "#333333")
             color = "#cfcfcf" if dimmed else base_color
             line_width = 4 if selected else 2
-            marker_radius = 5 if selected else 3
             coords = []
             screen_points = []
             for index, value in points:
@@ -1332,14 +1343,6 @@ class PortfolioApp(tk.Tk):
                     "y": y,
                     "color": base_color,
                 })
-                canvas.create_oval(
-                    x - marker_radius,
-                    y - marker_radius,
-                    x + marker_radius,
-                    y + marker_radius,
-                    fill=color,
-                    outline=color,
-                )
             if len(coords) >= 4:
                 canvas.create_line(*coords, fill=color, width=line_width)
             self.draw_chart_extreme_labels(canvas, name, screen_points, color, metric, chart_right)
@@ -1369,6 +1372,15 @@ class PortfolioApp(tk.Tk):
             labels = [("最高", max_point), ("最低", min_point)]
 
         for label_kind, point in labels:
+            canvas.create_oval(
+                point["x"] - 4,
+                point["y"] - 4,
+                point["x"] + 4,
+                point["y"] + 4,
+                fill="white",
+                outline=color,
+                width=2,
+            )
             label = (
                 f"{name} {label_kind} "
                 f"{self.format_chart_hover_value(point['value'], metric)}"
@@ -1494,15 +1506,6 @@ class PortfolioApp(tk.Tk):
                 anchor="nw",
                 fill=point["color"],
                 font=("Microsoft YaHei UI", 9, "bold") if selected else ("Microsoft YaHei UI", 9),
-                tags=("chart_hover",),
-            )
-            canvas.create_oval(
-                point["x"] - 5,
-                point["y"] - 5,
-                point["x"] + 5,
-                point["y"] + 5,
-                outline=point["color"],
-                width=2,
                 tags=("chart_hover",),
             )
 
