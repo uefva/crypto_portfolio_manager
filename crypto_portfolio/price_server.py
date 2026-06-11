@@ -28,6 +28,13 @@ from crypto_portfolio.market_data import (
 
 
 DEFAULT_CONFIG_PATH = "server_config.ini"
+LOG_LEVELS = {
+    "TRACE": 5,
+    "DEBUG": 10,
+    "INFO": 20,
+    "WARNING": 30,
+    "ERROR": 40,
+}
 
 
 @dataclass
@@ -62,6 +69,44 @@ def make_config_asset(category, market, symbol):
         "currency": currency_for(category, market),
         "quantity": 1.0,
     }
+
+
+def log_level_value(level):
+    return LOG_LEVELS.get(str(level or "INFO").strip().upper(), LOG_LEVELS["INFO"])
+
+
+def should_log(config, level):
+    return log_level_value(level) >= log_level_value(getattr(config, "log_level", "INFO"))
+
+
+def server_log(config, level, message):
+    if not should_log(config, level):
+        return
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{timestamp}] {level.upper()} {message}", flush=True)
+
+
+def format_config_counts(config):
+    return (
+        f"crypto={config.asset_counts.get(CATEGORY_CRYPTO, 0)} "
+        f"fund={config.asset_counts.get(CATEGORY_FUND, 0)} "
+        f"stock={config.asset_counts.get(CATEGORY_STOCK, 0)}"
+    )
+
+
+def format_enabled_categories(config):
+    return (
+        f"crypto={bool(config.enabled_categories.get(CATEGORY_CRYPTO))} "
+        f"fund={bool(config.enabled_categories.get(CATEGORY_FUND))} "
+        f"stock={bool(config.enabled_categories.get(CATEGORY_STOCK))}"
+    )
+
+
+def format_asset_preview(assets, limit=30):
+    asset_ids = [asset.get("asset_id", "") for asset in assets]
+    preview = asset_ids[:limit]
+    suffix = f", ... +{len(asset_ids) - limit}" if len(asset_ids) > limit else ""
+    return ",".join(preview) + suffix
 
 
 def load_config(config_path=DEFAULT_CONFIG_PATH):
@@ -126,14 +171,7 @@ def load_config(config_path=DEFAULT_CONFIG_PATH):
 
 
 def should_log_response_payload(config):
-    levels = {
-        "TRACE": 5,
-        "DEBUG": 10,
-        "INFO": 20,
-        "WARNING": 30,
-        "ERROR": 40,
-    }
-    return levels.get(config.log_level, 20) <= levels["DEBUG"]
+    return should_log(config, "DEBUG")
 
 
 class PriceHistoryStore:
@@ -412,7 +450,28 @@ class PriceCollector:
         config = load_config(self.config_path)
         assets = self.collect_assets(config)
         fetched_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        assets_by_id = {asset["asset_id"]: asset for asset in assets}
+        server_log(
+            config,
+            "INFO",
+            (
+                "COLLECT start "
+                f"assets={len(assets)} "
+                f"{format_config_counts(config)} "
+                f"{format_enabled_categories(config)} "
+                f"ids={format_asset_preview(assets)}"
+            ),
+        )
         if not assets:
+            server_log(
+                config,
+                "WARNING",
+                (
+                    "COLLECT skipped reason=no_assets "
+                    f"{format_config_counts(config)} "
+                    f"{format_enabled_categories(config)}"
+                ),
+            )
             return {
                 "status": "skipped",
                 "reason": "no_assets",
@@ -424,7 +483,34 @@ class PriceCollector:
             }
 
         quotes, errors = fetch_quotes_for_assets(assets, max_workers=24)
-        assets_by_id = {asset["asset_id"]: asset for asset in assets}
+        for asset_id, error in sorted(errors.items()):
+            asset = assets_by_id.get(asset_id, {})
+            server_log(
+                config,
+                "WARNING",
+                (
+                    "COLLECT failed "
+                    f"asset_id={asset_id} "
+                    f"category={asset.get('category', '')} "
+                    f"market={asset.get('market', '')} "
+                    f"symbol={asset.get('symbol', '')} "
+                    f"error={error}"
+                ),
+            )
+        for asset_id, quote in sorted(quotes.items()):
+            server_log(
+                config,
+                "DEBUG",
+                (
+                    "COLLECT quote "
+                    f"asset_id={asset_id} "
+                    f"price={quote.get('price')} "
+                    f"currency={quote.get('currency')} "
+                    f"price_cny={quote.get('price_cny')} "
+                    f"source={quote.get('source')}"
+                ),
+            )
+
         store = PriceHistoryStore(config.database)
         saved_count = store.save_asset_quotes(quotes, assets_by_id, fetched_at)
 
@@ -441,6 +527,18 @@ class PriceCollector:
         status = "saved" if saved_count == len(assets) else "partial"
         if saved_count == 0:
             status = "skipped"
+
+        server_log(
+            config,
+            "INFO",
+            (
+                "COLLECT finish "
+                f"status={status} "
+                f"saved={saved_count}/{len(assets)} "
+                f"missing={len(errors)} "
+                f"database={config.database}"
+            ),
+        )
 
         return {
             "status": status,
@@ -664,6 +762,19 @@ def run_server(config_path=DEFAULT_CONFIG_PATH):
     print(f"价格服务已启动: http://{config.host}:{config.port}")
     print(f"配置文件: {config_path}")
     print(f"日志等级: {config.log_level}")
+    server_log(
+        config,
+        "INFO",
+        (
+            "CONFIG loaded "
+            f"path={config_path} "
+            f"database={config.database} "
+            f"interval_minutes={config.interval_minutes} "
+            f"{format_config_counts(config)} "
+            f"{format_enabled_categories(config)} "
+            f"ids={format_asset_preview(config.assets)}"
+        ),
+    )
     try:
         server.serve_forever()
     except KeyboardInterrupt:
