@@ -1,3 +1,4 @@
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -58,6 +59,41 @@ class PriceHistoryStoreTest(unittest.TestCase):
             history = store.asset_history(asset_ids=[asset_id])
             self.assertEqual(history["assets"][asset_id]["symbol"], "QQQM")
             self.assertEqual(history["points"][0]["price_cny"][asset_id], 710.0)
+
+    def test_legacy_price_history_is_migrated_to_asset_history(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            database = Path(tmpdir) / "prices.sqlite3"
+            conn = sqlite3.connect(database)
+            try:
+                conn.execute("""
+                    CREATE TABLE price_history (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        symbol TEXT NOT NULL,
+                        price REAL NOT NULL,
+                        source TEXT NOT NULL,
+                        fetched_at TEXT NOT NULL,
+                        UNIQUE(symbol, fetched_at)
+                    )
+                """)
+                conn.execute("""
+                    INSERT INTO price_history(symbol, price, source, fetched_at)
+                    VALUES ('BTC', 100.0, 'legacy-test', '2026-06-10 10:00:00')
+                """)
+                conn.commit()
+            finally:
+                conn.close()
+
+            with patch("crypto_portfolio.price_server.fetch_fx_to_cny", return_value=(7.0, "test-rate", False)):
+                store = PriceHistoryStore(str(database))
+
+            asset_id = asset_id_for(CATEGORY_CRYPTO, MARKET_CRYPTO, "BTC")
+            latest = store.latest_asset_prices(asset_ids=[asset_id])
+            self.assertEqual(latest[asset_id]["price"], 100.0)
+            self.assertEqual(latest[asset_id]["price_cny"], 700.0)
+
+            legacy_history = store.history(["BTC"])
+            self.assertEqual(legacy_history[0]["prices"]["BTC"], 100.0)
+            self.assertEqual(legacy_history[0]["sources"]["BTC"], "legacy-test")
 
     def test_load_config_builds_assets_from_enabled_sections(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -155,6 +191,8 @@ database = price_history.sqlite3
 [prices]
 interval_minutes = 30
 database = {database}
+fetch_retries = 3
+retry_backoff_seconds = 0
 
 [crypto]
 enabled = false
@@ -197,6 +235,101 @@ us = QQQM
 
             history = PriceHistoryStore(str(database)).asset_history(asset_ids=[fund_id, stock_id])
             self.assertEqual(set(history["assets"]), {fund_id, stock_id})
+
+    def test_refresh_retries_missing_assets_before_saving(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            database = Path(tmpdir) / "prices.sqlite3"
+            config_path = self.write_config(tmpdir, f"""
+[prices]
+interval_minutes = 30
+database = {database}
+fetch_retries = 2
+retry_backoff_seconds = 0
+
+[crypto]
+enabled = true
+symbols = BTC,ETH
+""")
+            btc_id = asset_id_for(CATEGORY_CRYPTO, MARKET_CRYPTO, "BTC")
+            eth_id = asset_id_for(CATEGORY_CRYPTO, MARKET_CRYPTO, "ETH")
+            calls = {"count": 0}
+
+            def fake_fetch(assets, max_workers=16):
+                calls["count"] += 1
+                quotes = {}
+                errors = {}
+                for asset in assets:
+                    if calls["count"] == 1 and asset["asset_id"] == eth_id:
+                        errors[asset["asset_id"]] = "temporary failure"
+                        continue
+                    quotes[asset["asset_id"]] = {
+                        "category": asset["category"],
+                        "market": asset["market"],
+                        "symbol": asset["symbol"],
+                        "name": asset["symbol"],
+                        "currency": asset["currency"],
+                        "price": 100.0,
+                        "fx_to_cny": 7.0,
+                        "price_cny": 700.0,
+                        "source": "test",
+                    }
+                return quotes, errors
+
+            with patch("crypto_portfolio.price_server.fetch_quotes_for_assets", fake_fetch):
+                result = PriceCollector(str(config_path)).fetch_once()
+
+            self.assertEqual(result["status"], "saved")
+            self.assertEqual(result["saved_count"], 2)
+            history = PriceHistoryStore(str(database)).asset_history(asset_ids=[btc_id, eth_id])
+            self.assertEqual(set(history["assets"]), {btc_id, eth_id})
+            self.assertEqual(len(history["points"]), 1)
+
+    def test_refresh_does_not_save_partial_results_after_retries_fail(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            database = Path(tmpdir) / "prices.sqlite3"
+            config_path = self.write_config(tmpdir, f"""
+[prices]
+interval_minutes = 30
+database = {database}
+fetch_retries = 1
+retry_backoff_seconds = 0
+
+[crypto]
+enabled = true
+symbols = BTC,ETH
+""")
+            btc_id = asset_id_for(CATEGORY_CRYPTO, MARKET_CRYPTO, "BTC")
+            eth_id = asset_id_for(CATEGORY_CRYPTO, MARKET_CRYPTO, "ETH")
+
+            def fake_fetch(assets, max_workers=16):
+                quotes = {}
+                errors = {}
+                for asset in assets:
+                    if asset["asset_id"] == eth_id:
+                        errors[asset["asset_id"]] = "still failing"
+                        continue
+                    quotes[asset["asset_id"]] = {
+                        "category": asset["category"],
+                        "market": asset["market"],
+                        "symbol": asset["symbol"],
+                        "name": asset["symbol"],
+                        "currency": asset["currency"],
+                        "price": 100.0,
+                        "fx_to_cny": 7.0,
+                        "price_cny": 700.0,
+                        "source": "test",
+                    }
+                return quotes, errors
+
+            with patch("crypto_portfolio.price_server.fetch_quotes_for_assets", fake_fetch):
+                result = PriceCollector(str(config_path)).fetch_once()
+
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(result["saved_count"], 0)
+            self.assertEqual(result["missing_assets"], [eth_id])
+            history = PriceHistoryStore(str(database)).asset_history(asset_ids=[btc_id, eth_id])
+            self.assertEqual(history["assets"], {})
+            self.assertEqual(history["points"], [])
 
     def test_refresh_skips_when_all_categories_disabled(self):
         with tempfile.TemporaryDirectory() as tmpdir:

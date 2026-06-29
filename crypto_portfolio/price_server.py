@@ -2,6 +2,7 @@ import configparser
 import json
 import sqlite3
 import threading
+import time
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime
@@ -21,6 +22,7 @@ from crypto_portfolio.market_data import (
     MARKET_US,
     asset_id_for,
     currency_for,
+    fetch_fx_to_cny,
     fetch_quotes_for_assets,
     normalize_category,
     normalize_symbol,
@@ -47,6 +49,8 @@ class ServerConfig:
     asset_counts: dict
     interval_minutes: int
     database: str
+    fetch_retries: int
+    retry_backoff_seconds: float
     log_level: str
 
 
@@ -166,6 +170,8 @@ def load_config(config_path=DEFAULT_CONFIG_PATH):
         asset_counts=asset_counts,
         interval_minutes=parser.getint("prices", "interval_minutes", fallback=30),
         database=parser.get("prices", "database", fallback="price_history.sqlite3"),
+        fetch_retries=max(parser.getint("prices", "fetch_retries", fallback=3), 0),
+        retry_backoff_seconds=max(parser.getfloat("prices", "retry_backoff_seconds", fallback=2.0), 0.0),
         log_level=parser.get("logging", "level", fallback="INFO").strip().upper(),
     )
 
@@ -186,20 +192,6 @@ class PriceHistoryStore:
 
     def init_schema(self):
         with closing(self.connect()) as conn:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS price_history (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    symbol TEXT NOT NULL,
-                    price REAL NOT NULL,
-                    source TEXT NOT NULL,
-                    fetched_at TEXT NOT NULL,
-                    UNIQUE(symbol, fetched_at)
-                )
-            """)
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_price_history_symbol_time
-                ON price_history(symbol, fetched_at)
-            """)
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS asset_price_history (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -225,22 +217,68 @@ class PriceHistoryStore:
                 CREATE INDEX IF NOT EXISTS idx_asset_price_history_category_time
                 ON asset_price_history(category, fetched_at)
             """)
+            self.migrate_legacy_price_history(conn)
             conn.commit()
 
-    def save_prices(self, prices, sources, fetched_at):
-        if not prices:
+    def legacy_price_history_exists(self, conn):
+        row = conn.execute("""
+            SELECT 1
+            FROM sqlite_master
+            WHERE type = 'table' AND name = 'price_history'
+            LIMIT 1
+        """).fetchone()
+        return row is not None
+
+    def migrate_legacy_price_history(self, conn):
+        if not self.legacy_price_history_exists(conn):
             return 0
 
-        rows = [
-            (symbol, float(price), sources.get(symbol, "unknown"), fetched_at)
-            for symbol, price in prices.items()
-        ]
-        with closing(self.connect()) as conn:
-            conn.executemany("""
-                INSERT OR REPLACE INTO price_history(symbol, price, source, fetched_at)
-                VALUES (?, ?, ?, ?)
-            """, rows)
-            conn.commit()
+        row = conn.execute("""
+            SELECT 1
+            FROM price_history ph
+            LEFT JOIN asset_price_history aph
+              ON aph.asset_id = 'crypto:CRYPTO:' || UPPER(ph.symbol)
+             AND aph.fetched_at = ph.fetched_at
+            WHERE aph.id IS NULL
+            LIMIT 1
+        """).fetchone()
+        if row is None:
+            return 0
+
+        fx_to_cny, _fx_source, _fx_estimated = fetch_fx_to_cny("USD")
+        rows = []
+        for row in conn.execute("""
+            SELECT symbol, price, source, fetched_at
+            FROM price_history
+            WHERE symbol IS NOT NULL AND price IS NOT NULL AND fetched_at IS NOT NULL
+        """):
+            symbol = normalize_symbol(row[0], CATEGORY_CRYPTO, MARKET_CRYPTO)
+            asset_id = asset_id_for(CATEGORY_CRYPTO, MARKET_CRYPTO, symbol)
+            price = float(row[1])
+            rows.append((
+                asset_id,
+                CATEGORY_CRYPTO,
+                MARKET_CRYPTO,
+                symbol,
+                symbol,
+                "USD",
+                price,
+                float(fx_to_cny),
+                price * float(fx_to_cny),
+                row[2] or "legacy",
+                row[3],
+            ))
+
+        if not rows:
+            return 0
+
+        conn.executemany("""
+            INSERT OR IGNORE INTO asset_price_history(
+                asset_id, category, market, symbol, name, currency,
+                price, fx_to_cny, price_cny, source, fetched_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, rows)
         return len(rows)
 
     def save_asset_quotes(self, quotes, assets_by_id, fetched_at):
@@ -283,13 +321,14 @@ class PriceHistoryStore:
         with closing(self.connect()) as conn:
             conn.row_factory = sqlite3.Row
             for symbol in symbols:
+                symbol = normalize_symbol(symbol, CATEGORY_CRYPTO, MARKET_CRYPTO)
                 row = conn.execute("""
                     SELECT symbol, price, source, fetched_at
-                    FROM price_history
-                    WHERE symbol = ?
+                    FROM asset_price_history
+                    WHERE category = ? AND market = ? AND symbol = ?
                     ORDER BY fetched_at DESC
                     LIMIT 1
-                """, (symbol,)).fetchone()
+                """, (CATEGORY_CRYPTO, MARKET_CRYPTO, symbol)).fetchone()
                 if row:
                     latest[symbol] = {
                         "price": row["price"],
@@ -324,9 +363,10 @@ class PriceHistoryStore:
         if not symbols:
             return []
 
+        symbols = [normalize_symbol(symbol, CATEGORY_CRYPTO, MARKET_CRYPTO) for symbol in symbols]
         placeholders = ",".join("?" for _ in symbols)
-        params = list(symbols)
-        filters = [f"symbol IN ({placeholders})"]
+        params = [CATEGORY_CRYPTO, MARKET_CRYPTO, *symbols]
+        filters = ["category = ?", "market = ?", f"symbol IN ({placeholders})"]
         if start:
             filters.append("fetched_at >= ?")
             params.append(start)
@@ -337,7 +377,7 @@ class PriceHistoryStore:
 
         query = f"""
             SELECT symbol, price, source, fetched_at
-            FROM price_history
+            FROM asset_price_history
             WHERE {' AND '.join(filters)}
             ORDER BY fetched_at ASC, symbol ASC
             LIMIT ?
@@ -446,6 +486,50 @@ class PriceCollector:
     def collect_assets(self, config):
         return list(config.assets)
 
+    def fetch_assets_with_retries(self, assets, config):
+        quotes = {}
+        errors = {}
+        pending_assets = list(assets)
+        max_attempts = 1 + max(config.fetch_retries, 0)
+
+        for attempt in range(1, max_attempts + 1):
+            attempt_quotes, attempt_errors = fetch_quotes_for_assets(pending_assets, max_workers=24)
+            pending_ids = {
+                asset["asset_id"]
+                for asset in pending_assets
+            }
+
+            for asset_id, quote in attempt_quotes.items():
+                quotes[asset_id] = quote
+
+            missing_ids = pending_ids - set(attempt_quotes)
+            errors = {
+                asset_id: attempt_errors.get(asset_id, "missing quote")
+                for asset_id in missing_ids
+            }
+            pending_assets = [
+                asset for asset in pending_assets
+                if asset["asset_id"] in errors
+            ]
+
+            if not pending_assets:
+                return quotes, {}
+
+            server_log(
+                config,
+                "WARNING",
+                (
+                    "COLLECT retry "
+                    f"attempt={attempt}/{max_attempts} "
+                    f"missing={len(pending_assets)} "
+                    f"ids={format_asset_preview(pending_assets)}"
+                ),
+            )
+            if attempt < max_attempts and config.retry_backoff_seconds > 0:
+                time.sleep(config.retry_backoff_seconds)
+
+        return quotes, errors
+
     def fetch_once(self):
         config = load_config(self.config_path)
         assets = self.collect_assets(config)
@@ -482,7 +566,7 @@ class PriceCollector:
                 "assets": {},
             }
 
-        quotes, errors = fetch_quotes_for_assets(assets, max_workers=24)
+        quotes, errors = self.fetch_assets_with_retries(assets, config)
         for asset_id, error in sorted(errors.items()):
             asset = assets_by_id.get(asset_id, {})
             server_log(
@@ -512,17 +596,44 @@ class PriceCollector:
             )
 
         store = PriceHistoryStore(config.database)
-        saved_count = store.save_asset_quotes(quotes, assets_by_id, fetched_at)
+        if errors or len(quotes) != len(assets):
+            missing_assets = sorted(errors or (set(assets_by_id) - set(quotes)))
+            server_log(
+                config,
+                "ERROR",
+                (
+                    "COLLECT finish "
+                    f"status=failed "
+                    f"saved=0/{len(assets)} "
+                    f"missing={len(missing_assets)} "
+                    f"database={config.database}"
+                ),
+            )
+            return {
+                "status": "failed",
+                "reason": "missing_assets",
+                "fetched_at": fetched_at,
+                "saved_count": 0,
+                "missing_assets": missing_assets,
+                "errors": errors,
+                "prices": {
+                    asset_id: quote["price"]
+                    for asset_id, quote in quotes.items()
+                },
+                "assets": {
+                    asset_id: {
+                        "category": quote.get("category"),
+                        "market": quote.get("market"),
+                        "symbol": quote.get("symbol"),
+                        "name": quote.get("name"),
+                        "currency": quote.get("currency"),
+                        "price_cny": quote.get("price_cny"),
+                    }
+                    for asset_id, quote in quotes.items()
+                },
+            }
 
-        crypto_prices = {}
-        crypto_sources = {}
-        for asset_id, quote in quotes.items():
-            if quote.get("category") != CATEGORY_CRYPTO:
-                continue
-            symbol = quote.get("symbol")
-            crypto_prices[symbol] = quote["price"]
-            crypto_sources[symbol] = quote.get("source", "unknown")
-        store.save_prices(crypto_prices, crypto_sources, fetched_at)
+        saved_count = store.save_asset_quotes(quotes, assets_by_id, fetched_at)
 
         status = "saved" if saved_count == len(assets) else "partial"
         if saved_count == 0:

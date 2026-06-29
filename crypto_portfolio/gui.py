@@ -1,3 +1,4 @@
+import configparser
 from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlparse
@@ -37,6 +38,15 @@ MARKET_CODE_BY_DISPLAY = {
 }
 CATEGORY_OPTIONS = (CATEGORY_FUND, CATEGORY_STOCK, CATEGORY_CRYPTO)
 CATEGORY_FILTER_OPTIONS = (CATEGORY_ALL, *CATEGORY_OPTIONS)
+DEFAULT_GUI_CONFIG_PATH = "gui_config.ini"
+DEFAULT_SERVER_URL = "http://127.0.0.1:8765"
+
+
+def load_gui_server_url(config_path=DEFAULT_GUI_CONFIG_PATH):
+    parser = configparser.ConfigParser()
+    parser.read(config_path, encoding="utf-8")
+    url = parser.get("server", "url", fallback=DEFAULT_SERVER_URL).strip()
+    return url or DEFAULT_SERVER_URL
 
 
 class PortfolioApp(tk.Tk):
@@ -71,7 +81,7 @@ class PortfolioApp(tk.Tk):
         self.chart_source_var = tk.StringVar(value="服务端价格记录")
         self.chart_metric_var = tk.StringVar(value="收益金额")
         self.chart_range_var = tk.StringVar(value="全部时间")
-        self.server_url_var = tk.StringVar(value="http://687pq84al732.vicp.fun:47649")
+        self.server_url_var = tk.StringVar(value=load_gui_server_url())
         self.profit_chart_data = None
         self.profit_chart_layout = None
         self.highlighted_series = None
@@ -103,6 +113,12 @@ class PortfolioApp(tk.Tk):
 
         status = ttk.Label(self, textvariable=self.status_var, anchor="w")
         status.pack(fill="x", padx=10, pady=8)
+
+    def pack_tree_with_horizontal_scrollbar(self, tree):
+        scrollbar = ttk.Scrollbar(tree.master, orient="horizontal", command=tree.xview)
+        tree.configure(xscrollcommand=scrollbar.set)
+        tree.pack(fill="both", expand=True)
+        scrollbar.pack(fill="x")
 
     def create_holdings_tab(self):
         toolbar = ttk.Frame(self.holdings_tab)
@@ -173,7 +189,7 @@ class PortfolioApp(tk.Tk):
             self.holdings_tree.column(column, width=widths[column], anchor=anchor)
         self.configure_rate_tags(self.holdings_tree)
         self.configure_sortable_tree(self.holdings_tree, headings)
-        self.holdings_tree.pack(fill="both", expand=True)
+        self.pack_tree_with_horizontal_scrollbar(self.holdings_tree)
         ttk.Label(self.holdings_tab, textvariable=self.holding_summary_var, anchor="w").pack(
             fill="x", pady=(8, 0)
         )
@@ -319,7 +335,7 @@ class PortfolioApp(tk.Tk):
             self.transactions_tree.column(column, width=widths[column], anchor=anchor, stretch=column != "asset_id")
         self.transactions_tree.column("asset_id", width=1, minwidth=1, stretch=False)
         self.configure_sortable_tree(self.transactions_tree, headings)
-        self.transactions_tree.pack(fill="both", expand=True)
+        self.pack_tree_with_horizontal_scrollbar(self.transactions_tree)
         self.transactions_tree.bind("<<TreeviewSelect>>", self.on_transaction_select)
 
     def create_snapshots_tab(self):
@@ -355,7 +371,7 @@ class PortfolioApp(tk.Tk):
             self.snapshots_tree.heading(column, text=title)
             self.snapshots_tree.column(column, width=width, anchor="w")
         self.configure_sortable_tree(self.snapshots_tree, snapshot_headings)
-        self.snapshots_tree.pack(fill="both", expand=True)
+        self.pack_tree_with_horizontal_scrollbar(self.snapshots_tree)
         self.snapshots_tree.bind("<<TreeviewSelect>>", self.on_snapshot_select)
 
         detail_columns = (
@@ -388,7 +404,7 @@ class PortfolioApp(tk.Tk):
             self.snapshot_detail_tree.column(column, width=110, anchor=anchor)
         self.configure_rate_tags(self.snapshot_detail_tree)
         self.configure_sortable_tree(self.snapshot_detail_tree, detail_headings)
-        self.snapshot_detail_tree.pack(fill="both", expand=True)
+        self.pack_tree_with_horizontal_scrollbar(self.snapshot_detail_tree)
         ttk.Label(right, textvariable=self.snapshot_summary_var, anchor="w").pack(
             fill="x", pady=(8, 0)
         )
