@@ -902,11 +902,11 @@ class PortfolioApp(tk.Tk):
             return {"labels": [], "series": {}, "all_series": {}, "series_meta": {}, "metric": metric, "source": "server"}
 
         server_url = self.normalize_server_url()
+        range_start = self.get_chart_range_start()
         params = {
             "asset_ids": ",".join(sorted(holdings)),
-            "limit": "5000",
+            "limit": "5000" if range_start else "0",
         }
-        range_start = self.get_chart_range_start()
         if range_start:
             params["start"] = range_start.strftime("%Y-%m-%d %H:%M:%S")
         payload = self.fetch_server_json(server_url, "/api/assets/history", params)

@@ -76,3 +76,4 @@ __pycache__
 portfolio_backups/
 holding_snapshots/
 *.sqlite3
+*.ini

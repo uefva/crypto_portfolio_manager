@@ -404,22 +404,36 @@ class PriceHistoryStore:
         if end:
             filters.append("fetched_at <= ?")
             params.append(end)
-        params.append(limit)
 
         where = f"WHERE {' AND '.join(filters)}" if filters else ""
+        limit_clause = "LIMIT ?" if limit and limit > 0 else ""
+        time_params = list(params)
+        if limit_clause:
+            time_params.append(limit)
+
+        outer_filters, outer_params = self.asset_filters(asset_ids, categories, prefix="aph.")
+        outer_where = f"WHERE {' AND '.join(outer_filters)}" if outer_filters else ""
+        query_params = time_params + outer_params
         query = f"""
-            SELECT *
-            FROM asset_price_history
-            {where}
-            ORDER BY fetched_at ASC, asset_id ASC
-            LIMIT ?
+            WITH selected_times AS (
+                SELECT DISTINCT fetched_at
+                FROM asset_price_history
+                {where}
+                ORDER BY fetched_at ASC
+                {limit_clause}
+            )
+            SELECT aph.*
+            FROM asset_price_history aph
+            JOIN selected_times st ON aph.fetched_at = st.fetched_at
+            {outer_where}
+            ORDER BY aph.fetched_at ASC, aph.asset_id ASC
         """
 
         assets = {}
         points_by_time = {}
         with closing(self.connect()) as conn:
             conn.row_factory = sqlite3.Row
-            for row in conn.execute(query, params):
+            for row in conn.execute(query, query_params):
                 payload = self.asset_row_to_payload(row)
                 assets[row["asset_id"]] = {
                     "asset_id": row["asset_id"],
@@ -449,16 +463,16 @@ class PriceHistoryStore:
             "points": list(points_by_time.values()),
         }
 
-    def asset_filters(self, asset_ids=None, categories=None):
+    def asset_filters(self, asset_ids=None, categories=None, prefix=""):
         filters = []
         params = []
         if asset_ids:
             placeholders = ",".join("?" for _ in asset_ids)
-            filters.append(f"asset_id IN ({placeholders})")
+            filters.append(f"{prefix}asset_id IN ({placeholders})")
             params.extend(asset_ids)
         if categories:
             placeholders = ",".join("?" for _ in categories)
-            filters.append(f"category IN ({placeholders})")
+            filters.append(f"{prefix}category IN ({placeholders})")
             params.extend(categories)
         return filters, params
 
@@ -745,6 +759,16 @@ def parse_categories(query):
     return [normalize_category(value) for value in values]
 
 
+def parse_limit(query, default=5000):
+    raw = str(query.get("limit", [str(default)])[0]).strip().lower()
+    if raw in {"", "all", "none", "0"}:
+        return 0
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return default
+
+
 def make_handler(config_path, collector):
     class PriceRequestHandler(BaseHTTPRequestHandler):
         def do_OPTIONS(self):
@@ -801,7 +825,7 @@ def make_handler(config_path, collector):
                 return
 
             if parsed.path == "/api/assets/history":
-                limit = int(query.get("limit", ["5000"])[0])
+                limit = parse_limit(query, default=5000)
                 payload = store.asset_history(
                     asset_ids=parse_asset_ids(query),
                     categories=parse_categories(query),

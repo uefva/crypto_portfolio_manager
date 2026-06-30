@@ -1,6 +1,7 @@
 import sqlite3
 import tempfile
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
@@ -16,7 +17,7 @@ from crypto_portfolio.market_data import (
     MARKET_US,
     asset_id_for,
 )
-from crypto_portfolio.price_server import PriceCollector, PriceHistoryStore, load_config
+from crypto_portfolio.price_server import PriceCollector, PriceHistoryStore, load_config, parse_limit
 
 
 class PriceHistoryStoreTest(unittest.TestCase):
@@ -94,6 +95,73 @@ class PriceHistoryStoreTest(unittest.TestCase):
             legacy_history = store.history(["BTC"])
             self.assertEqual(legacy_history[0]["prices"]["BTC"], 100.0)
             self.assertEqual(legacy_history[0]["sources"]["BTC"], "legacy-test")
+
+    def test_asset_history_limit_counts_time_points_not_rows(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            database = Path(tmpdir) / "prices.sqlite3"
+            store = PriceHistoryStore(str(database))
+            assets = [
+                (asset_id_for(CATEGORY_CRYPTO, MARKET_CRYPTO, "BTC"), CATEGORY_CRYPTO, MARKET_CRYPTO, "BTC", "BTC", "USD"),
+                (asset_id_for(CATEGORY_CRYPTO, MARKET_CRYPTO, "ETH"), CATEGORY_CRYPTO, MARKET_CRYPTO, "ETH", "ETH", "USD"),
+                (asset_id_for(CATEGORY_STOCK, MARKET_US, "QQQM"), CATEGORY_STOCK, MARKET_US, "QQQM", "QQQM", "USD"),
+            ]
+            start_at = datetime(2026, 1, 1, 0, 0, 0)
+            rows = []
+            for point_index in range(1000):
+                fetched_at = (start_at + timedelta(minutes=point_index)).strftime("%Y-%m-%d %H:%M:%S")
+                for asset_index, (asset_id, category, market, symbol, name, currency) in enumerate(assets):
+                    price = 100.0 + point_index + asset_index
+                    rows.append((
+                        asset_id,
+                        category,
+                        market,
+                        symbol,
+                        name,
+                        currency,
+                        price,
+                        7.0,
+                        price * 7.0,
+                        "test",
+                        fetched_at,
+                    ))
+
+            conn = sqlite3.connect(database)
+            try:
+                conn.executemany("""
+                    INSERT INTO asset_price_history(
+                        asset_id, category, market, symbol, name, currency,
+                        price, fx_to_cny, price_cny, source, fetched_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, rows)
+                conn.commit()
+            finally:
+                conn.close()
+
+            limited = store.asset_history(limit=500)
+            self.assertEqual(len(limited["points"]), 500)
+            self.assertEqual(len(limited["points"][0]["price_cny"]), 3)
+            self.assertEqual(len(limited["points"][-1]["price_cny"]), 3)
+
+            all_points = store.asset_history(limit=0)
+            self.assertEqual(len(all_points["points"]), 1000)
+
+            btc_id = assets[0][0]
+            filtered = store.asset_history(
+                asset_ids=[btc_id],
+                start=(start_at + timedelta(minutes=100)).strftime("%Y-%m-%d %H:%M:%S"),
+                end=(start_at + timedelta(minutes=199)).strftime("%Y-%m-%d %H:%M:%S"),
+                limit=0,
+            )
+            self.assertEqual(len(filtered["points"]), 100)
+            self.assertEqual(set(filtered["assets"]), {btc_id})
+            self.assertTrue(all(set(point["price_cny"]) == {btc_id} for point in filtered["points"]))
+
+    def test_parse_limit_supports_unlimited_and_invalid_values(self):
+        self.assertEqual(parse_limit({"limit": ["all"]}), 0)
+        self.assertEqual(parse_limit({"limit": ["0"]}), 0)
+        self.assertEqual(parse_limit({"limit": ["bad"]}, default=123), 123)
+        self.assertEqual(parse_limit({"limit": ["500"]}), 500)
 
     def test_load_config_builds_assets_from_enabled_sections(self):
         with tempfile.TemporaryDirectory() as tmpdir:
