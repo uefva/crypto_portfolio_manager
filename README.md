@@ -152,6 +152,23 @@ POST /api/refresh
 
 `/api/prices/*` 为旧版加密货币接口，目前保留兼容，但底层读取新版 `asset_price_history` 表；`/api/assets/*` 为新版股票、基金、加密货币混合资产接口。
 
-`/api/assets/history` 的 `limit` 表示最多返回多少个时间点，而不是最多返回多少条数据库记录。由于每个时间点可能包含多个资产价格，服务端会先筛选时间点，再返回这些时间点下的完整资产价格。`limit=0` 或 `limit=all` 表示不限制时间点数量，GUI 在“全部时间”查询时会使用不限量模式。
+`/api/assets/history` 的 `limit` 表示最多返回多少个时间点，而不是最多返回多少条数据库记录。由于每个时间点可能包含多个资产价格，服务端会先筛选时间点，再返回这些时间点下的资产价格。`limit=0` 或 `limit=all` 表示不限制时间点数量，GUI 在“全部时间”查询时会使用不限量模式。
+
+`/api/assets/history` 默认返回精简结构，只包含收益走势图需要的 `timestamp` 和 `price_cny`，以减少服务端组装和网络传输时间：
+
+```json
+{
+  "points": [
+    {
+      "timestamp": "2026-01-01 00:00:00",
+      "price_cny": {
+        "crypto:CRYPTO:BTC": 700000.0
+      }
+    }
+  ]
+}
+```
+
+如果需要兼容旧版完整结构，可以添加 `full=1`，返回 `assets`、`prices`、`price_cny`、`fx_to_cny` 和 `sources`。服务端还支持 gzip 压缩：客户端请求头包含 `Accept-Encoding: gzip` 且响应较大时，会返回 `Content-Encoding: gzip`；常见 HTTP 客户端会自动解压。
 
 旧版本数据库中的 `price_history` 表如果存在，会在服务端启动或初始化数据库时自动迁移到新版 `asset_price_history` 表。迁移使用 `INSERT OR IGNORE`，不会覆盖新表已有的同一资产同一时间点数据。迁移后旧表不会被删除，但后续服务端不再读写旧表。

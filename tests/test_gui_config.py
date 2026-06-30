@@ -57,17 +57,25 @@ class GuiConfigTest(unittest.TestCase):
 
         def fake_fetch(server_url, path, params):
             captured.update({"server_url": server_url, "path": path, "params": params})
-            return {"points": []}
+            return {
+                "points": [{
+                    "timestamp": "2026-01-01 00:00:00",
+                    "price_cny": {"crypto:CRYPTO:BTC": 120.0},
+                }]
+            }
 
         app.fetch_server_json = fake_fetch
 
-        PortfolioApp.build_server_profit_chart_data(app)
+        result = PortfolioApp.build_server_profit_chart_data(app)
 
         self.assertEqual(captured["server_url"], "http://server.test")
         self.assertEqual(captured["path"], "/api/assets/history")
         self.assertEqual(captured["params"]["asset_ids"], "crypto:CRYPTO:BTC")
         self.assertEqual(captured["params"]["limit"], "0")
         self.assertNotIn("start", captured["params"])
+        self.assertEqual(result["labels"], ["2026-01-01 00:00:00"])
+        self.assertEqual(result["source"], "server")
+        self.assertTrue(result["series"])
 
     def test_server_history_request_keeps_start_for_limited_ranges(self):
         app = PortfolioApp.__new__(PortfolioApp)

@@ -1,4 +1,5 @@
 import configparser
+import gzip
 import json
 import sqlite3
 import threading
@@ -30,6 +31,7 @@ from crypto_portfolio.market_data import (
 
 
 DEFAULT_CONFIG_PATH = "server_config.ini"
+GZIP_MIN_BYTES = 1024
 LOG_LEVELS = {
     "TRACE": 5,
     "DEBUG": 10,
@@ -396,7 +398,7 @@ class PriceHistoryStore:
 
         return list(points_by_time.values())
 
-    def asset_history(self, asset_ids=None, categories=None, start=None, end=None, limit=5000):
+    def asset_history(self, asset_ids=None, categories=None, start=None, end=None, limit=5000, compact=True):
         filters, params = self.asset_filters(asset_ids, categories)
         if start:
             filters.append("fetched_at >= ?")
@@ -414,6 +416,11 @@ class PriceHistoryStore:
         outer_filters, outer_params = self.asset_filters(asset_ids, categories, prefix="aph.")
         outer_where = f"WHERE {' AND '.join(outer_filters)}" if outer_filters else ""
         query_params = time_params + outer_params
+        selected_columns = (
+            "aph.asset_id, aph.fetched_at, aph.price_cny"
+            if compact
+            else "aph.*"
+        )
         query = f"""
             WITH selected_times AS (
                 SELECT DISTINCT fetched_at
@@ -422,7 +429,7 @@ class PriceHistoryStore:
                 ORDER BY fetched_at ASC
                 {limit_clause}
             )
-            SELECT aph.*
+            SELECT {selected_columns}
             FROM asset_price_history aph
             JOIN selected_times st ON aph.fetched_at = st.fetched_at
             {outer_where}
@@ -434,34 +441,42 @@ class PriceHistoryStore:
         with closing(self.connect()) as conn:
             conn.row_factory = sqlite3.Row
             for row in conn.execute(query, query_params):
-                payload = self.asset_row_to_payload(row)
-                assets[row["asset_id"]] = {
-                    "asset_id": row["asset_id"],
-                    "category": row["category"],
-                    "market": row["market"],
-                    "symbol": row["symbol"],
-                    "name": row["name"],
-                    "currency": row["currency"],
-                }
+                if not compact:
+                    assets[row["asset_id"]] = {
+                        "asset_id": row["asset_id"],
+                        "category": row["category"],
+                        "market": row["market"],
+                        "symbol": row["symbol"],
+                        "name": row["name"],
+                        "currency": row["currency"],
+                    }
                 point = points_by_time.setdefault(
                     row["fetched_at"],
-                    {
-                        "timestamp": row["fetched_at"],
-                        "prices": {},
-                        "price_cny": {},
-                        "fx_to_cny": {},
-                        "sources": {},
-                    },
+                    self.empty_asset_history_point(row["fetched_at"], compact),
                 )
-                point["prices"][row["asset_id"]] = row["price"]
                 point["price_cny"][row["asset_id"]] = row["price_cny"]
-                point["fx_to_cny"][row["asset_id"]] = row["fx_to_cny"]
-                point["sources"][row["asset_id"]] = row["source"]
+                if not compact:
+                    point["prices"][row["asset_id"]] = row["price"]
+                    point["fx_to_cny"][row["asset_id"]] = row["fx_to_cny"]
+                    point["sources"][row["asset_id"]] = row["source"]
 
-        return {
-            "assets": assets,
-            "points": list(points_by_time.values()),
+        payload = {"points": list(points_by_time.values())}
+        if not compact:
+            payload["assets"] = assets
+        return payload
+
+    def empty_asset_history_point(self, fetched_at, compact=True):
+        point = {
+            "timestamp": fetched_at,
+            "price_cny": {},
         }
+        if not compact:
+            point.update({
+                "prices": {},
+                "fx_to_cny": {},
+                "sources": {},
+            })
+        return point
 
     def asset_filters(self, asset_ids=None, categories=None, prefix=""):
         filters = []
@@ -769,6 +784,15 @@ def parse_limit(query, default=5000):
         return default
 
 
+def parse_bool(query, key, default=False):
+    raw = str(query.get(key, [str(default)])[0]).strip().lower()
+    if raw in {"1", "true", "yes", "y", "on"}:
+        return True
+    if raw in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
+
+
 def make_handler(config_path, collector):
     class PriceRequestHandler(BaseHTTPRequestHandler):
         def do_OPTIONS(self):
@@ -832,6 +856,7 @@ def make_handler(config_path, collector):
                     start=query.get("start", [None])[0],
                     end=query.get("end", [None])[0],
                     limit=limit,
+                    compact=not parse_bool(query, "full", default=False),
                 )
                 self.send_json(payload)
                 return
@@ -852,8 +877,14 @@ def make_handler(config_path, collector):
         def send_json(self, payload, status=200):
             config = load_config(config_path)
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            compressed = self.should_gzip(body)
+            if compressed:
+                body = gzip.compress(body)
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
+            if compressed:
+                self.send_header("Content-Encoding", "gzip")
+                self.send_header("Vary", "Accept-Encoding")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
@@ -866,6 +897,12 @@ def make_handler(config_path, collector):
                     f"{self.path} status={status}: "
                     f"{json.dumps(payload, ensure_ascii=False)}"
                 )
+
+        def should_gzip(self, body):
+            if len(body) < GZIP_MIN_BYTES:
+                return False
+            accept_encoding = self.headers.get("Accept-Encoding", "")
+            return "gzip" in accept_encoding.lower()
 
         def get_client_ip(self):
             for header in ("CF-Connecting-IP", "X-Real-IP", "X-Forwarded-For"):
