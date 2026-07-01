@@ -79,12 +79,17 @@ server_config.ini                # 服务端配置，包含采集资产、采集
 gui_config.ini                   # 图形界面配置，包含客户端连接的服务端地址
 crypto_portfolio/                # 应用代码
   __init__.py
-  cli.py                         # 命令行菜单和用户输入，默认处理加密货币
-  gui.py                         # 图形化多资产增删改查界面和收益走势图
-  market_data.py                 # 股票、基金、加密货币、汇率行情查询
-  price_server.py                # SQLite 价格采集、投资组合服务端和 HTTP 接口
-  portfolio_api_client.py        # GUI 调用服务端投资组合 API 的客户端
-  portfolio_manager.py           # 本地持仓、交易、备份、人民币收益逻辑和离线回退
+  cli/                           # 命令行菜单和用户输入
+  desktop/                       # 图形界面主窗口、配置和后续 tab 模块
+  domain/                        # 资产、市场、币种等通用领域定义
+  market/                        # 股票、基金、加密货币、汇率行情查询
+  portfolio/                     # 本地组合管理、服务端 API client、导入导出
+  server/                        # SQLite 价格采集、投资组合服务端和 HTTP 接口
+  gui.py                         # 兼容导出：旧 GUI 导入路径
+  market_data.py                 # 兼容导出：旧行情导入路径
+  price_server.py                # 兼容导出：旧服务端导入路径
+  portfolio_api_client.py        # 兼容导出：旧 API client 导入路径
+  portfolio_manager.py           # 兼容导出：旧本地组合管理导入路径
 requirements.txt                 # Python 依赖
 portfolio.json                   # 本地持仓数据，自动升级到 v2，不提交到仓库
 portfolio_backups/               # 自动备份目录，不提交到仓库
@@ -92,6 +97,8 @@ holding_snapshots/               # 持仓查询结果快照，不提交到仓库
 price_history.sqlite3            # 服务端价格历史数据库，不提交到仓库
 okx_credentials.json             # 本地凭据，不提交到仓库
 ```
+
+兼容导出文件会保留旧导入路径，例如 `from crypto_portfolio.price_server import main` 仍然可用；新代码建议直接使用 `crypto_portfolio.server`、`crypto_portfolio.market`、`crypto_portfolio.portfolio` 和 `crypto_portfolio.desktop` 下的模块。
 
 ## 图形界面配置与迁移
 
