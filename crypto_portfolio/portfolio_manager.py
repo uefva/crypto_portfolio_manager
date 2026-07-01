@@ -2,8 +2,6 @@ import json
 from datetime import datetime
 from pathlib import Path
 
-from tabulate import tabulate
-
 from crypto_portfolio.market_data import (
     CATEGORY_ALL,
     CATEGORY_CRYPTO,
@@ -779,6 +777,8 @@ class PortfolioManager:
         return snapshot_path
 
     def print_holdings_table(self, rows):
+        from tabulate import tabulate
+
         print(tabulate(
             rows,
             headers=[
@@ -866,6 +866,8 @@ class PortfolioManager:
             return
 
         rows.sort(key=lambda x: x[3])
+        from tabulate import tabulate
+
         print(tabulate(
             rows,
             headers=["类别", "市场", "代码", "日期", "类型", "数量", "价格", "币种", "汇率", "人民币金额"],

@@ -3,7 +3,7 @@ import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-from io import StringIO
+from html.parser import HTMLParser
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -293,12 +293,73 @@ def extract_eastmoney_fund_table(text, fund_code):
     return html.unescape(table_html)
 
 
-def fetch_fund_quote(fund_code):
-    try:
-        import pandas as pd
-    except ImportError as exc:
-        raise RuntimeError("基金净值解析需要安装 pandas 和 lxml。") from exc
+class FundTableParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.in_cell = False
+        self.current_cell = []
+        self.current_row = []
+        self.rows = []
 
+    def handle_starttag(self, tag, attrs):
+        if tag.lower() in {"td", "th"}:
+            self.in_cell = True
+            self.current_cell = []
+
+    def handle_data(self, data):
+        if self.in_cell:
+            self.current_cell.append(data)
+
+    def handle_endtag(self, tag):
+        tag = tag.lower()
+        if tag in {"td", "th"} and self.in_cell:
+            text = html.unescape("".join(self.current_cell)).strip()
+            self.current_row.append(re.sub(r"\s+", " ", text))
+            self.in_cell = False
+        elif tag == "tr":
+            if self.current_row:
+                self.rows.append(self.current_row)
+                self.current_row = []
+
+
+def find_column_index(headers, candidates):
+    for candidate in candidates:
+        for index, header in enumerate(headers):
+            if candidate in header:
+                return index
+    return None
+
+
+def parse_fund_table_rows(table_html, fund_code):
+    parser = FundTableParser()
+    parser.feed(table_html)
+    if len(parser.rows) < 2:
+        raise ValueError(f"{fund_code} fund net value table is empty")
+
+    headers = [header.replace(" ", "") for header in parser.rows[0]]
+    date_index = find_column_index(headers, ("净值日期", "日期"))
+    value_index = find_column_index(headers, ("单位净值",))
+    if date_index is None or value_index is None:
+        raise ValueError(f"{fund_code} fund net value table is missing required columns")
+
+    parsed_rows = []
+    for row in parser.rows[1:]:
+        if len(row) <= max(date_index, value_index):
+            continue
+        value = to_float(row[value_index])
+        if value is None:
+            continue
+        parsed_rows.append({
+            "date": row[date_index],
+            "unit_value": value,
+        })
+
+    if not parsed_rows:
+        raise ValueError(f"{fund_code} fund net value table has no valid rows")
+    return parsed_rows
+
+
+def fetch_fund_quote(fund_code):
     fund_code = normalize_symbol(fund_code, CATEGORY_FUND, MARKET_FUND)
     url = "http://fund.eastmoney.com/f10/F10DataApi.aspx"
     params = {
@@ -310,37 +371,27 @@ def fetch_fund_quote(fund_code):
     response = request_get(url, params=params, timeout=PRICE_TIMEOUT)
     response.encoding = "utf-8"
     table_html = extract_eastmoney_fund_table(response.text, fund_code)
-    frames = pd.read_html(StringIO(table_html))
-    if not frames:
-        raise ValueError(f"{fund_code} 没有解析到基金净值")
+    rows = parse_fund_table_rows(table_html, fund_code)
 
-    frame = frames[0]
-    if "单位净值" not in frame.columns:
-        raise ValueError(f"{fund_code} 基金净值表缺少单位净值")
-    frame["单位净值"] = pd.to_numeric(frame["单位净值"], errors="coerce")
-    frame = frame.dropna(subset=["单位净值"])
-    if frame.empty:
-        raise ValueError(f"{fund_code} 基金净值为空")
-
-    latest = frame.iloc[0]
+    latest = rows[0]
     previous_close = None
     change = None
     change_pct = None
-    if len(frame) >= 2:
-        previous = to_float(frame.iloc[1].get("单位净值"))
-        current = to_float(latest.get("单位净值"))
-        if current is not None and previous and previous > 0:
+    if len(rows) >= 2:
+        previous = rows[1]["unit_value"]
+        current = latest["unit_value"]
+        if previous > 0:
             previous_close = previous
             change = current - previous
             change_pct = change / previous * 100
 
     return {
-        "price": float(latest["单位净值"]),
+        "price": latest["unit_value"],
         "currency": "CNY",
         "source": "东方财富基金净值",
         "name": fund_code,
         "fetched_at": now_text(),
-        "price_date": str(latest.get("净值日期", "")),
+        "price_date": latest["date"],
         "previous_close": previous_close,
         "change": change,
         "change_pct": change_pct,
@@ -556,3 +607,4 @@ def fetch_quotes_for_assets(assets, max_workers=16):
             except Exception as exc:
                 errors[asset_id] = str(exc)
     return quotes, errors
+
