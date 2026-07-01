@@ -26,7 +26,9 @@ class StructureTest(unittest.TestCase):
         from crypto_portfolio.portfolio.local_store import PortfolioManager
         from crypto_portfolio.server.price_store import PriceHistoryStore
         from crypto_portfolio.server.portfolio_store import PortfolioStore
+        from crypto_portfolio.server.portfolio_import_export import PortfolioImportExportMixin
         from crypto_portfolio.desktop.config import load_gui_server_url
+        from crypto_portfolio.desktop.tabs.profit_chart import ProfitChartMixin
         from crypto_portfolio.cli import main
 
         self.assertEqual(asset_id_for("基金", "CN_FUND", "270042"), "fund:CN_FUND:270042")
@@ -38,6 +40,8 @@ class StructureTest(unittest.TestCase):
         self.assertTrue(PortfolioManager)
         self.assertTrue(PriceHistoryStore)
         self.assertTrue(PortfolioStore)
+        self.assertTrue(PortfolioImportExportMixin)
+        self.assertTrue(ProfitChartMixin)
         self.assertTrue(callable(load_gui_server_url))
         self.assertTrue(callable(main))
 
