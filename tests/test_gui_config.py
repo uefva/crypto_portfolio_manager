@@ -23,7 +23,9 @@ class FakeManager:
             "symbol": "BTC",
             "name": "BTC",
             "quantity": 1.0,
-            "total_cost_cny": 100.0,
+            "total_cost": 20.0,
+            "total_cost_cny": 20.0,
+            "currency": "USD",
         }]
 
 
@@ -61,6 +63,7 @@ class GuiConfigTest(unittest.TestCase):
                 "points": [{
                     "timestamp": "2026-01-01 00:00:00",
                     "price_cny": {"crypto:CRYPTO:BTC": 120.0},
+                    "fx_to_cny": {"crypto:CRYPTO:BTC": 7.0},
                 }]
             }
 
@@ -72,10 +75,12 @@ class GuiConfigTest(unittest.TestCase):
         self.assertEqual(captured["path"], "/api/assets/history")
         self.assertEqual(captured["params"]["asset_ids"], "crypto:CRYPTO:BTC")
         self.assertEqual(captured["params"]["limit"], "0")
+        self.assertEqual(captured["params"]["full"], "1")
         self.assertNotIn("start", captured["params"])
         self.assertEqual(result["labels"], ["2026-01-01 00:00:00"])
         self.assertEqual(result["source"], "server")
         self.assertTrue(result["series"])
+        self.assertEqual(result["series"]["总资产"][0][1], -20.0)
 
     def test_server_history_request_keeps_start_for_limited_ranges(self):
         app = PortfolioApp.__new__(PortfolioApp)

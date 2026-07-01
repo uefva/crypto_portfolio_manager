@@ -1,4 +1,5 @@
 import html
+import json
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -72,6 +73,9 @@ DEFAULT_FX_TO_CNY = {
 }
 FX_CACHE_SECONDS = 600
 _FX_CACHE = {}
+_FUND_CATALOG_CACHE = None
+_FUND_CATALOG_CACHE_SECONDS = 24 * 60 * 60
+_FUND_CATALOG_CACHE_AT = 0
 
 
 def now_text():
@@ -233,6 +237,167 @@ def asset_label(asset):
     return f"{category} {symbol}"
 
 
+def suggestion_label(asset):
+    symbol = asset.get("symbol", "")
+    name = asset.get("name") or symbol
+    if name and name != symbol:
+        return f"{name} ({symbol})"
+    return symbol
+
+
+def search_match_text(asset):
+    parts = [
+        asset.get("symbol", ""),
+        asset.get("name", ""),
+        asset.get("pinyin", ""),
+        asset.get("abbr", ""),
+    ]
+    return " ".join(str(part) for part in parts).upper()
+
+
+def parse_fund_catalog(text):
+    text = str(text or "").lstrip("\ufeff").strip()
+    match = re.search(r"var\s+r\s*=\s*(\[.*\])\s*;?\s*$", text, re.S)
+    if not match:
+        raise ValueError("基金代码表格式无效")
+
+    rows = json.loads(match.group(1))
+    catalog = []
+    for row in rows:
+        if len(row) < 3:
+            continue
+        symbol = normalize_symbol(row[0], CATEGORY_FUND, MARKET_FUND)
+        catalog.append({
+            "asset_id": asset_id_for(CATEGORY_FUND, MARKET_FUND, symbol),
+            "category": CATEGORY_FUND,
+            "market": MARKET_FUND,
+            "symbol": symbol,
+            "name": row[2] or symbol,
+            "currency": currency_for(CATEGORY_FUND, MARKET_FUND),
+            "abbr": row[1] if len(row) > 1 else "",
+            "fund_type": row[3] if len(row) > 3 else "",
+            "pinyin": row[4] if len(row) > 4 else "",
+        })
+    return catalog
+
+
+def fetch_fund_catalog(force_refresh=False):
+    global _FUND_CATALOG_CACHE, _FUND_CATALOG_CACHE_AT
+    if (
+        not force_refresh
+        and _FUND_CATALOG_CACHE is not None
+        and time.time() - _FUND_CATALOG_CACHE_AT < _FUND_CATALOG_CACHE_SECONDS
+    ):
+        return _FUND_CATALOG_CACHE
+
+    response = request_get(
+        "https://fund.eastmoney.com/js/fundcode_search.js",
+        timeout=PRICE_TIMEOUT,
+    )
+    response.encoding = "utf-8"
+    catalog = parse_fund_catalog(response.text)
+    _FUND_CATALOG_CACHE = catalog
+    _FUND_CATALOG_CACHE_AT = time.time()
+    return catalog
+
+
+def fund_name_for_code(fund_code):
+    fund_code = normalize_symbol(fund_code, CATEGORY_FUND, MARKET_FUND)
+    try:
+        for fund in fetch_fund_catalog():
+            if fund["symbol"] == fund_code:
+                return fund.get("name") or fund_code
+    except Exception:
+        pass
+    return fund_code
+
+
+def search_fund_suggestions(query, limit=20):
+    query = str(query or "").strip()
+    if not query:
+        return []
+
+    query_upper = query.upper()
+    matches = [
+        fund for fund in fetch_fund_catalog()
+        if query_upper in search_match_text(fund)
+    ]
+    return matches[:limit]
+
+
+def market_from_eastmoney_row(row):
+    mkt_num = str(row.get("MktNum") or row.get("mkt_num") or "").upper()
+    jys = str(row.get("JYS") or "").upper()
+    classify = str(row.get("Classify") or "").upper()
+    security_name = str(row.get("SecurityTypeName") or "")
+
+    if mkt_num == "116" or jys == "HK" or classify == "HK":
+        return MARKET_HK
+    if mkt_num in {"105", "106", "107"} or "US" in classify or "美股" in security_name:
+        return MARKET_US
+    if mkt_num == "1" or jys in {"1", "2"} or "沪" in security_name:
+        return MARKET_SH
+    if mkt_num == "0" or jys in {"0", "SZ"} or "深" in security_name:
+        return MARKET_SZ
+    return None
+
+
+def search_stock_suggestions(query, market=None, limit=20):
+    query = str(query or "").strip()
+    if not query:
+        return []
+
+    response = request_get(
+        "https://searchapi.eastmoney.com/api/suggest/get",
+        params={
+            "input": query,
+            "type": "14",
+            "token": "D43BF722C8E33BDC906FB84D85E326E8",
+        },
+        timeout=PRICE_TIMEOUT,
+    )
+    response.encoding = "utf-8"
+    rows = response.json().get("QuotationCodeTable", {}).get("Data", []) or []
+    target_market = normalize_market(market, CATEGORY_STOCK) if market else None
+    suggestions = []
+    seen = set()
+    for row in rows:
+        row_market = market_from_eastmoney_row(row)
+        if row_market is None:
+            continue
+        if target_market and row_market != target_market:
+            continue
+        symbol = normalize_symbol(row.get("Code") or row.get("UnifiedCode"), CATEGORY_STOCK, row_market)
+        if not symbol:
+            continue
+        asset_id = asset_id_for(CATEGORY_STOCK, row_market, symbol)
+        if asset_id in seen:
+            continue
+        seen.add(asset_id)
+        suggestions.append({
+            "asset_id": asset_id,
+            "category": CATEGORY_STOCK,
+            "market": row_market,
+            "symbol": symbol,
+            "name": row.get("Name") or symbol,
+            "currency": currency_for(CATEGORY_STOCK, row_market),
+            "pinyin": row.get("PinYin") or "",
+        })
+        if len(suggestions) >= limit:
+            break
+    return suggestions
+
+
+def search_asset_suggestions(query, category, market=None, limit=20):
+    category = normalize_category(category)
+    market = normalize_market(market, category)
+    if category == CATEGORY_FUND:
+        return search_fund_suggestions(query, limit=limit)
+    if category == CATEGORY_STOCK:
+        return search_stock_suggestions(query, market=market, limit=limit)
+    return []
+
+
 def fetch_eastmoney_quote(secids):
     if isinstance(secids, str):
         secids = [secids]
@@ -389,7 +554,7 @@ def fetch_fund_quote(fund_code):
         "price": latest["unit_value"],
         "currency": "CNY",
         "source": "东方财富基金净值",
-        "name": fund_code,
+        "name": fund_name_for_code(fund_code),
         "fetched_at": now_text(),
         "price_date": latest["date"],
         "previous_close": previous_close,

@@ -24,8 +24,10 @@ from crypto_portfolio.market_data import (
     MARKET_SZ,
     MARKET_US,
     currency_for,
+    suggestion_label,
     normalize_category,
     normalize_market,
+    normalize_symbol,
 )
 from crypto_portfolio.portfolio_manager import PortfolioManager
 
@@ -58,7 +60,9 @@ class PortfolioApp(tk.Tk):
 
         self.manager = PortfolioManager()
         self.selected_transaction = None
+        self.selected_asset_id = None
         self.latest_quotes = {}
+        self.symbol_display_to_asset = {}
 
         self.status_var = tk.StringVar(value="就绪")
         self.holding_category_var = tk.StringVar(value=CATEGORY_ALL)
@@ -75,8 +79,11 @@ class PortfolioApp(tk.Tk):
         self.amount_var = tk.StringVar()
         self.price_var = tk.StringVar()
         self.currency_var = tk.StringVar(value="USD")
-        self.fx_var = tk.StringVar()
         self.date_var = tk.StringVar(value=self.manager.now())
+        self.asset_category_var = tk.StringVar(value=CATEGORY_FUND)
+        self.asset_market_var = tk.StringVar(value=MARKET_DISPLAY_BY_CODE[MARKET_FUND])
+        self.asset_symbol_var = tk.StringVar()
+        self.asset_name_var = tk.StringVar()
 
         self.chart_source_var = tk.StringVar(value="服务端价格记录")
         self.chart_metric_var = tk.StringVar(value="收益金额")
@@ -89,6 +96,7 @@ class PortfolioApp(tk.Tk):
         self.chart_series_meta = {}
 
         self.create_widgets()
+        self.update_asset_market_options()
         self.update_form_market_options()
         self.refresh_all()
 
@@ -97,16 +105,19 @@ class PortfolioApp(tk.Tk):
         self.notebook.pack(fill="both", expand=True, padx=10, pady=(10, 0))
 
         self.holdings_tab = ttk.Frame(self.notebook)
+        self.assets_tab = ttk.Frame(self.notebook)
         self.transactions_tab = ttk.Frame(self.notebook)
         self.snapshots_tab = ttk.Frame(self.notebook)
         self.profit_chart_tab = ttk.Frame(self.notebook)
 
         self.notebook.add(self.holdings_tab, text="持仓")
+        self.notebook.add(self.assets_tab, text="资产管理")
         self.notebook.add(self.transactions_tab, text="交易记录")
         self.notebook.add(self.snapshots_tab, text="历史持仓结果")
         self.notebook.add(self.profit_chart_tab, text="收益走势")
 
         self.create_holdings_tab()
+        self.create_assets_tab()
         self.create_transactions_tab()
         self.create_snapshots_tab()
         self.create_profit_chart_tab()
@@ -194,6 +205,86 @@ class PortfolioApp(tk.Tk):
             fill="x", pady=(8, 0)
         )
 
+    def create_assets_tab(self):
+        form = ttk.LabelFrame(self.assets_tab, text="资产")
+        form.pack(fill="x", pady=(0, 8))
+
+        ttk.Label(form, text="类别").grid(row=0, column=0, padx=6, pady=6, sticky="w")
+        asset_category_combo = ttk.Combobox(
+            form,
+            textvariable=self.asset_category_var,
+            values=CATEGORY_OPTIONS,
+            width=12,
+            state="readonly",
+        )
+        asset_category_combo.grid(row=0, column=1, padx=6, pady=6, sticky="we")
+        asset_category_combo.bind("<<ComboboxSelected>>", lambda _event: self.update_asset_market_options())
+
+        ttk.Label(form, text="市场").grid(row=0, column=2, padx=6, pady=6, sticky="w")
+        self.asset_market_combo = ttk.Combobox(
+            form,
+            textvariable=self.asset_market_var,
+            width=12,
+            state="readonly",
+        )
+        self.asset_market_combo.grid(row=0, column=3, padx=6, pady=6, sticky="we")
+
+        ttk.Label(form, text="代码").grid(row=0, column=4, padx=6, pady=6, sticky="w")
+        ttk.Entry(form, textvariable=self.asset_symbol_var, width=16).grid(
+            row=0, column=5, padx=6, pady=6, sticky="we"
+        )
+
+        ttk.Label(form, text="名称").grid(row=0, column=6, padx=6, pady=6, sticky="w")
+        ttk.Entry(form, textvariable=self.asset_name_var, width=24).grid(
+            row=0, column=7, padx=6, pady=6, sticky="we"
+        )
+
+        buttons = ttk.Frame(form)
+        buttons.grid(row=1, column=5, columnspan=3, padx=6, pady=6, sticky="e")
+        ttk.Button(buttons, text="新增", command=self.add_asset).pack(side="left")
+        ttk.Button(buttons, text="保存修改", command=self.update_asset).pack(side="left", padx=8)
+        ttk.Button(buttons, text="删除空资产", command=self.delete_selected_asset).pack(side="left")
+        ttk.Button(buttons, text="清空", command=self.clear_asset_form).pack(side="left", padx=(8, 0))
+
+        for column in range(8):
+            form.columnconfigure(column, weight=1)
+
+        columns = ("category", "market", "symbol", "name", "currency", "quantity", "transactions", "asset_id")
+        self.assets_tree = ttk.Treeview(
+            self.assets_tab,
+            columns=columns,
+            show="headings",
+            height=20,
+        )
+        headings = {
+            "category": "类别",
+            "market": "市场",
+            "symbol": "代码",
+            "name": "名称",
+            "currency": "币种",
+            "quantity": "持仓数量",
+            "transactions": "交易数",
+            "asset_id": "资产ID",
+        }
+        widths = {
+            "category": 80,
+            "market": 100,
+            "symbol": 120,
+            "name": 220,
+            "currency": 70,
+            "quantity": 120,
+            "transactions": 80,
+            "asset_id": 1,
+        }
+        for column in columns:
+            anchor = "w" if column in {"category", "market", "symbol", "name", "currency"} else "e"
+            self.assets_tree.heading(column, text=headings[column])
+            self.assets_tree.column(column, width=widths[column], anchor=anchor, stretch=column != "asset_id")
+        self.assets_tree.column("asset_id", width=1, minwidth=1, stretch=False)
+        self.configure_sortable_tree(self.assets_tree, headings)
+        self.pack_tree_with_horizontal_scrollbar(self.assets_tree)
+        self.assets_tree.bind("<<TreeviewSelect>>", self.on_asset_select)
+
     def create_transactions_tab(self):
         summary_bar = ttk.Frame(self.transactions_tab)
         summary_bar.pack(fill="x", pady=(0, 8))
@@ -224,7 +315,7 @@ class PortfolioApp(tk.Tk):
             state="readonly",
         )
         category_combo.grid(row=0, column=1, padx=6, pady=6, sticky="we")
-        category_combo.bind("<<ComboboxSelected>>", lambda _event: self.update_form_market_options())
+        category_combo.bind("<<ComboboxSelected>>", lambda _event: self.on_trade_category_changed())
 
         ttk.Label(form, text="市场").grid(row=0, column=2, padx=6, pady=6, sticky="w")
         self.market_combo = ttk.Combobox(
@@ -234,16 +325,13 @@ class PortfolioApp(tk.Tk):
             state="readonly",
         )
         self.market_combo.grid(row=0, column=3, padx=6, pady=6, sticky="we")
-        self.market_combo.bind("<<ComboboxSelected>>", lambda _event: self.update_currency_from_form())
+        self.market_combo.bind("<<ComboboxSelected>>", lambda _event: self.on_trade_market_changed())
 
         ttk.Label(form, text="代码").grid(row=0, column=4, padx=6, pady=6, sticky="w")
-        self.symbol_combo = ttk.Combobox(form, textvariable=self.symbol_var, width=16)
+        self.symbol_combo = ttk.Combobox(form, textvariable=self.symbol_var, width=24)
         self.symbol_combo.grid(row=0, column=5, padx=6, pady=6, sticky="we")
-
-        ttk.Label(form, text="名称").grid(row=0, column=6, padx=6, pady=6, sticky="w")
-        ttk.Entry(form, textvariable=self.name_var, width=18).grid(
-            row=0, column=7, padx=6, pady=6, sticky="we"
-        )
+        self.symbol_combo.bind("<<ComboboxSelected>>", self.on_symbol_selected)
+        self.symbol_combo.bind("<KeyRelease>", self.on_symbol_keyrelease)
 
         ttk.Label(form, text="类型").grid(row=1, column=0, padx=6, pady=6, sticky="w")
         ttk.Combobox(
@@ -254,12 +342,14 @@ class PortfolioApp(tk.Tk):
             state="readonly",
         ).grid(row=1, column=1, padx=6, pady=6, sticky="we")
 
-        ttk.Label(form, text="数量").grid(row=1, column=2, padx=6, pady=6, sticky="w")
+        self.amount_label = ttk.Label(form, text="数量")
+        self.amount_label.grid(row=1, column=2, padx=6, pady=6, sticky="w")
         ttk.Entry(form, textvariable=self.amount_var, width=16).grid(
             row=1, column=3, padx=6, pady=6, sticky="we"
         )
 
-        ttk.Label(form, text="价格").grid(row=1, column=4, padx=6, pady=6, sticky="w")
+        self.price_label = ttk.Label(form, text="价格")
+        self.price_label.grid(row=1, column=4, padx=6, pady=6, sticky="w")
         ttk.Entry(form, textvariable=self.price_var, width=16).grid(
             row=1, column=5, padx=6, pady=6, sticky="we"
         )
@@ -269,14 +359,9 @@ class PortfolioApp(tk.Tk):
             row=1, column=7, padx=6, pady=6, sticky="w"
         )
 
-        ttk.Label(form, text="汇率(CNY)").grid(row=2, column=0, padx=6, pady=6, sticky="w")
-        ttk.Entry(form, textvariable=self.fx_var, width=16).grid(
-            row=2, column=1, padx=6, pady=6, sticky="we"
-        )
-
-        ttk.Label(form, text="日期").grid(row=2, column=2, padx=6, pady=6, sticky="w")
+        ttk.Label(form, text="日期").grid(row=2, column=0, padx=6, pady=6, sticky="w")
         ttk.Entry(form, textvariable=self.date_var, width=22).grid(
-            row=2, column=3, columnspan=2, padx=6, pady=6, sticky="we"
+            row=2, column=1, columnspan=4, padx=6, pady=6, sticky="we"
         )
 
         buttons = ttk.Frame(form)
@@ -291,7 +376,7 @@ class PortfolioApp(tk.Tk):
 
         columns = (
             "category", "market", "symbol", "name", "index", "type", "date",
-            "amount", "price", "currency", "fx", "total_cny", "asset_id",
+            "amount", "price", "currency", "total", "asset_id",
         )
         self.transactions_tree = ttk.Treeview(
             self.transactions_tab,
@@ -310,8 +395,7 @@ class PortfolioApp(tk.Tk):
             "amount": "数量",
             "price": "价格",
             "currency": "币种",
-            "fx": "汇率",
-            "total_cny": "人民币金额",
+            "total": "成交金额",
             "asset_id": "资产ID",
         }
         widths = {
@@ -325,8 +409,7 @@ class PortfolioApp(tk.Tk):
             "amount": 110,
             "price": 100,
             "currency": 60,
-            "fx": 80,
-            "total_cny": 120,
+            "total": 120,
             "asset_id": 1,
         }
         for column in columns:
@@ -510,42 +593,133 @@ class PortfolioApp(tk.Tk):
 
     def refresh_all(self):
         self.manager.data = self.manager.load_data()
+        self.refresh_assets()
         self.refresh_symbols()
         self.refresh_transactions()
         self.refresh_snapshots()
         self.status_var.set("本地数据已刷新")
 
     def refresh_symbols(self):
-        assets = self.manager.get_assets()
-        values = sorted({
-            asset["symbol"] for asset in assets
-        } | set(COIN_MAP.keys()))
+        suggestions = self.manager.asset_suggestions(
+            self.symbol_var.get(),
+            self.category_var.get(),
+            self.current_form_market(),
+        )
+        if normalize_category(self.category_var.get()) == CATEGORY_CRYPTO:
+            suggestions.extend({
+                "category": CATEGORY_CRYPTO,
+                "market": MARKET_CRYPTO,
+                "symbol": symbol,
+                "name": symbol,
+                "currency": "USD",
+                "asset_id": f"crypto:CRYPTO:{symbol}",
+            } for symbol in COIN_MAP)
+
+        self.symbol_display_to_asset = {}
+        values = []
+        seen = set()
+        for asset in suggestions:
+            display = suggestion_label(asset)
+            asset_id = asset.get("asset_id")
+            if display in seen:
+                continue
+            seen.add(display)
+            values.append(display)
+            self.symbol_display_to_asset[display] = asset
+            if asset_id:
+                self.symbol_display_to_asset[asset_id] = asset
+            self.symbol_display_to_asset[asset.get("symbol", "")] = asset
         self.symbol_combo["values"] = values
 
     def current_form_market(self):
         return MARKET_CODE_BY_DISPLAY.get(self.market_var.get(), self.market_var.get())
 
+    def current_asset_market(self):
+        return MARKET_CODE_BY_DISPLAY.get(self.asset_market_var.get(), self.asset_market_var.get())
+
+    def markets_for_category(self, category):
+        category = normalize_category(category)
+        if category == CATEGORY_FUND:
+            return [MARKET_FUND]
+        if category == CATEGORY_STOCK:
+            return [MARKET_SH, MARKET_SZ, MARKET_HK, MARKET_US]
+        return [MARKET_CRYPTO]
+
     def update_form_market_options(self):
         category = normalize_category(self.category_var.get())
-        if category == CATEGORY_FUND:
-            markets = [MARKET_FUND]
-        elif category == CATEGORY_STOCK:
-            markets = [MARKET_SH, MARKET_SZ, MARKET_HK, MARKET_US]
-        else:
-            markets = [MARKET_CRYPTO]
+        markets = self.markets_for_category(category)
         displays = [MARKET_DISPLAY_BY_CODE[market] for market in markets]
         self.market_combo["values"] = displays
         if self.market_var.get() not in displays:
             self.market_var.set(displays[0])
         self.update_currency_from_form()
+        self.update_trade_amount_labels()
+        self.refresh_symbols()
+
+    def update_asset_market_options(self):
+        category = normalize_category(self.asset_category_var.get())
+        markets = self.markets_for_category(category)
+        displays = [MARKET_DISPLAY_BY_CODE[market] for market in markets]
+        self.asset_market_combo["values"] = displays
+        if self.asset_market_var.get() not in displays:
+            self.asset_market_var.set(displays[0])
+
+    def on_trade_category_changed(self):
+        self.symbol_var.set("")
+        self.name_var.set("")
+        self.update_form_market_options()
+
+    def on_trade_market_changed(self):
+        self.symbol_var.set("")
+        self.name_var.set("")
+        self.update_currency_from_form()
+        self.refresh_symbols()
 
     def update_currency_from_form(self):
         category = normalize_category(self.category_var.get())
         market = normalize_market(self.current_form_market(), category)
         currency = currency_for(category, market)
         self.currency_var.set(currency)
-        if currency == "CNY" and not self.fx_var.get().strip():
-            self.fx_var.set("1")
+
+    def update_trade_amount_labels(self):
+        if normalize_category(self.category_var.get()) == CATEGORY_FUND:
+            self.amount_label.configure(text="确认份额")
+            self.price_label.configure(text="确认净值")
+        else:
+            self.amount_label.configure(text="数量")
+            self.price_label.configure(text="价格")
+
+    def on_symbol_keyrelease(self, _event):
+        self.refresh_symbols()
+
+    def on_symbol_selected(self, _event=None):
+        asset = self.symbol_display_to_asset.get(self.symbol_var.get())
+        if not asset:
+            return
+        self.symbol_var.set(suggestion_label(asset))
+        self.name_var.set(asset.get("name") or asset.get("symbol", ""))
+        self.currency_var.set(asset.get("currency") or currency_for(asset.get("category"), asset.get("market")))
+
+    def selected_trade_asset(self):
+        text = self.symbol_var.get().strip()
+        asset = self.symbol_display_to_asset.get(text)
+        if asset:
+            return asset
+        category = normalize_category(self.category_var.get())
+        market = normalize_market(self.current_form_market(), category)
+        symbol = normalize_symbol(text, category, market)
+        asset_id = self.manager.find_asset_id(symbol, category, market)
+        existing = self.manager.data.get(asset_id)
+        if existing:
+            return existing
+        return {
+            "asset_id": asset_id,
+            "category": category,
+            "market": market,
+            "symbol": symbol,
+            "name": self.name_var.get().strip() or symbol,
+            "currency": currency_for(category, market),
+        }
 
     def apply_holdings_filter(self):
         if self.latest_quotes:
@@ -607,6 +781,90 @@ class PortfolioApp(tk.Tk):
 
         self.run_background(task, on_success, "正在计算总资产收益...")
 
+    def refresh_assets(self):
+        if not hasattr(self, "assets_tree"):
+            return
+        rows = []
+        for asset in self.manager.get_assets():
+            rows.append((
+                asset["category"],
+                MARKET_LABELS.get(asset["market"], asset["market"]),
+                asset["symbol"],
+                asset.get("name", asset["symbol"]),
+                asset.get("currency", currency_for(asset["category"], asset["market"])),
+                self.manager.format_quantity(asset.get("quantity", 0)),
+                len(asset.get("transactions", [])),
+                asset["asset_id"],
+            ))
+        self.fill_tree(self.assets_tree, rows)
+
+    def add_asset(self):
+        asset = self.manager.upsert_asset(
+            self.asset_category_var.get(),
+            self.current_asset_market(),
+            self.asset_symbol_var.get(),
+            self.asset_name_var.get(),
+        )
+        if asset:
+            self.clear_asset_form()
+            self.after_data_change("资产已保存")
+        else:
+            messagebox.showwarning("未保存", "资产没有保存，请检查代码和名称。")
+
+    def update_asset(self):
+        if not self.selected_asset_id:
+            messagebox.showinfo("提示", "请先选择一个资产。")
+            return
+
+        if self.manager.update_asset(
+            self.selected_asset_id,
+            self.asset_category_var.get(),
+            self.current_asset_market(),
+            self.asset_symbol_var.get(),
+            self.asset_name_var.get(),
+        ):
+            self.clear_asset_form()
+            self.after_data_change("资产已修改")
+        else:
+            messagebox.showwarning("未保存", "修改失败。有交易记录的资产只能修改名称。")
+
+    def delete_selected_asset(self):
+        if not self.selected_asset_id:
+            messagebox.showinfo("提示", "请先选择一个资产。")
+            return
+        if not messagebox.askyesno("确认删除", "确认删除选中的空资产？"):
+            return
+
+        if self.manager.delete_asset(self.selected_asset_id):
+            self.clear_asset_form()
+            self.after_data_change("资产已删除")
+        else:
+            messagebox.showwarning("未删除", "只能删除没有交易记录的资产。")
+
+    def on_asset_select(self, _event):
+        selection = self.assets_tree.selection()
+        if not selection:
+            return
+
+        category, market_label, symbol, name, _currency, _quantity, _transactions, asset_id = (
+            self.assets_tree.item(selection[0], "values")
+        )
+        self.selected_asset_id = asset_id
+        self.asset_category_var.set(category)
+        self.update_asset_market_options()
+        self.asset_market_var.set(market_label)
+        self.asset_symbol_var.set(symbol)
+        self.asset_name_var.set(name)
+
+    def clear_asset_form(self):
+        self.selected_asset_id = None
+        self.asset_category_var.set(CATEGORY_FUND)
+        self.update_asset_market_options()
+        self.asset_symbol_var.set("")
+        self.asset_name_var.set("")
+        if hasattr(self, "assets_tree"):
+            self.assets_tree.selection_remove(self.assets_tree.selection())
+
     def run_background(self, task, on_success, busy_message, on_done=None):
         self.status_var.set(busy_message)
 
@@ -649,8 +907,7 @@ class PortfolioApp(tk.Tk):
                 tx["amount"],
                 tx["price"],
                 tx["currency"],
-                f"{float(tx['fx_to_cny']):.4f}",
-                f"{float(tx['total_cny']):.2f}",
+                f"{float(tx['total']):.4f}",
                 tx["asset_id"],
             ))
         self.fill_tree(self.transactions_tree, rows)
@@ -895,7 +1152,7 @@ class PortfolioApp(tk.Tk):
         holdings = {
             asset["asset_id"]: asset
             for asset in self.manager.get_active_assets()
-            if asset.get("quantity", 0) > 0 and asset.get("total_cost_cny", 0) > 0
+            if asset.get("quantity", 0) > 0 and asset.get("total_cost", 0) > 0
         }
         metric = self.chart_metric_var.get()
         if not holdings:
@@ -906,6 +1163,7 @@ class PortfolioApp(tk.Tk):
         params = {
             "asset_ids": ",".join(sorted(holdings)),
             "limit": "5000" if range_start else "0",
+            "full": "1",
         }
         if range_start:
             params["start"] = range_start.strftime("%Y-%m-%d %H:%M:%S")
@@ -920,6 +1178,7 @@ class PortfolioApp(tk.Tk):
                 continue
 
             price_cny = point.get("price_cny", {})
+            fx_to_cny = point.get("fx_to_cny", {})
             point_index = len(labels)
             point_values = {}
             category_values = {
@@ -934,7 +1193,13 @@ class PortfolioApp(tk.Tk):
                 if price is None:
                     continue
                 value = asset["quantity"] * float(price)
-                cost = asset["total_cost_cny"]
+                fx = fx_to_cny.get(asset_id)
+                if fx is None:
+                    if asset.get("currency", "").upper() == "CNY":
+                        fx = 1.0
+                    else:
+                        continue
+                cost = asset["total_cost"] * float(fx)
                 profit = value - cost
                 point_values[asset_id] = (profit, cost)
                 total_profit += profit
@@ -1561,10 +1826,11 @@ class PortfolioApp(tk.Tk):
         self.draw_profit_chart()
 
     def parse_trade_form(self):
-        category = normalize_category(self.category_var.get())
-        market = normalize_market(self.current_form_market(), category)
-        symbol = self.symbol_var.get().strip().upper()
-        name = self.name_var.get().strip()
+        selected_asset = self.selected_trade_asset()
+        category = normalize_category(selected_asset.get("category"))
+        market = normalize_market(selected_asset.get("market"), category)
+        symbol = selected_asset.get("symbol", "").strip().upper()
+        name = selected_asset.get("name", "").strip()
         tx_type = "buy" if self.tx_type_var.get() == "买入" else "sell"
         try:
             amount = float(self.amount_var.get().strip())
@@ -1572,29 +1838,21 @@ class PortfolioApp(tk.Tk):
         except ValueError:
             messagebox.showerror("输入错误", "数量和价格必须是有效数字。")
             return None
-        fx_text = self.fx_var.get().strip()
-        fx_to_cny = None
-        if fx_text:
-            try:
-                fx_to_cny = float(fx_text)
-            except ValueError:
-                messagebox.showerror("输入错误", "汇率必须是有效数字，或留空自动获取。")
-                return None
 
         date = self.date_var.get().strip()
-        return category, market, symbol, name, tx_type, amount, price, date, fx_to_cny
+        return category, market, symbol, name, tx_type, amount, price, date
 
     def add_transaction(self):
         parsed = self.parse_trade_form()
         if parsed is None:
             return
 
-        category, market, symbol, name, tx_type, amount, price, date, fx_to_cny = parsed
+        category, market, symbol, name, tx_type, amount, price, date = parsed
         if tx_type == "buy":
-            saved = self.manager.buy_asset(category, market, symbol, amount, price, date, name, fx_to_cny)
+            saved = self.manager.buy_asset(category, market, symbol, amount, price, date, name)
         else:
             asset_id = self.manager.find_asset_id(symbol, category, market)
-            saved = self.manager.sell_asset(asset_id, amount, price, date, fx_to_cny)
+            saved = self.manager.sell_asset(asset_id, amount, price, date)
 
         if saved:
             self.after_data_change("交易已新增")
@@ -1616,7 +1874,7 @@ class PortfolioApp(tk.Tk):
             messagebox.showwarning("提示", "选中的资产不存在。")
             return
 
-        category, market, symbol, _name, tx_type, amount, price, date, fx_to_cny = parsed
+        category, market, symbol, _name, tx_type, amount, price, date = parsed
         if (
             normalize_category(category) != asset["category"]
             or normalize_market(market, category) != asset["market"]
@@ -1625,7 +1883,7 @@ class PortfolioApp(tk.Tk):
             messagebox.showwarning("暂不支持", "编辑时不能修改类别、市场或代码。如需更换资产，请删除后重新新增。")
             return
 
-        if self.manager.update_transaction_by_asset(asset_id, old_index, tx_type, amount, price, date, fx_to_cny):
+        if self.manager.update_transaction_by_asset(asset_id, old_index, tx_type, amount, price, date):
             self.after_data_change("交易已修改")
         else:
             messagebox.showwarning("未保存", "修改失败，请检查输入和后续卖出记录。")
@@ -1653,20 +1911,31 @@ class PortfolioApp(tk.Tk):
         values = self.transactions_tree.item(selection[0], "values")
         (
             category, market_label, symbol, name, index, tx_type, date,
-            amount, price, currency, fx, _total_cny, asset_id,
+            amount, price, currency, _total, asset_id,
         ) = values
         self.selected_transaction = (asset_id, int(index))
         self.category_var.set(category)
         self.update_form_market_options()
         self.market_var.set(market_label)
-        self.symbol_var.set(symbol)
+        asset = self.manager.data.get(asset_id, {
+            "asset_id": asset_id,
+            "category": category,
+            "market": self.current_form_market(),
+            "symbol": symbol,
+            "name": name,
+            "currency": currency,
+        })
+        display = suggestion_label(asset)
+        self.symbol_display_to_asset[display] = asset
+        self.symbol_display_to_asset[symbol] = asset
+        self.symbol_var.set(display)
         self.name_var.set(name)
         self.tx_type_var.set(tx_type)
         self.date_var.set(date)
         self.amount_var.set(amount)
         self.price_var.set(price)
         self.currency_var.set(currency)
-        self.fx_var.set(fx)
+        self.update_trade_amount_labels()
 
     def clear_transaction_form(self):
         self.selected_transaction = None
@@ -1677,11 +1946,11 @@ class PortfolioApp(tk.Tk):
         self.tx_type_var.set("买入")
         self.amount_var.set("")
         self.price_var.set("")
-        self.fx_var.set("")
         self.date_var.set(self.manager.now())
         self.transactions_tree.selection_remove(self.transactions_tree.selection())
 
     def after_data_change(self, message):
+        self.refresh_assets()
         self.refresh_symbols()
         self.refresh_transactions()
         self.tx_summary_var.set("持仓已变化，点击“刷新收益”查看当前总资产收益")
