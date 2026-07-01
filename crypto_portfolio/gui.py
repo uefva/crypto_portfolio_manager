@@ -29,6 +29,7 @@ from crypto_portfolio.market_data import (
     normalize_market,
     normalize_symbol,
 )
+from crypto_portfolio.portfolio_api_client import PortfolioApiClient
 from crypto_portfolio.portfolio_manager import PortfolioManager
 
 
@@ -58,7 +59,8 @@ class PortfolioApp(tk.Tk):
         self.geometry("1320x780")
         self.minsize(1080, 660)
 
-        self.manager = PortfolioManager()
+        self.local_manager = PortfolioManager()
+        self.manager = PortfolioApiClient(load_gui_server_url(), fallback=self.local_manager)
         self.selected_transaction = None
         self.selected_asset_id = None
         self.latest_quotes = {}
@@ -244,6 +246,7 @@ class PortfolioApp(tk.Tk):
         ttk.Button(buttons, text="新增", command=self.add_asset).pack(side="left")
         ttk.Button(buttons, text="保存修改", command=self.update_asset).pack(side="left", padx=8)
         ttk.Button(buttons, text="删除空资产", command=self.delete_selected_asset).pack(side="left")
+        ttk.Button(buttons, text="导入本地数据到服务端", command=self.import_local_portfolio_to_server).pack(side="left", padx=8)
         ttk.Button(buttons, text="清空", command=self.clear_asset_form).pack(side="left", padx=(8, 0))
 
         for column in range(8):
@@ -592,12 +595,17 @@ class PortfolioApp(tk.Tk):
         self.profit_chart_canvas.bind("<Leave>", lambda _event: self.clear_chart_hover())
 
     def refresh_all(self):
+        if hasattr(self.manager, "server_url"):
+            self.manager.server_url = self.normalize_server_url()
         self.manager.data = self.manager.load_data()
         self.refresh_assets()
         self.refresh_symbols()
         self.refresh_transactions()
         self.refresh_snapshots()
-        self.status_var.set("本地数据已刷新")
+        if getattr(self.manager, "online", False):
+            self.status_var.set("服务端数据已刷新")
+        else:
+            self.status_var.set("服务端不可用，已使用本地只读数据")
 
     def refresh_symbols(self):
         suggestions = self.manager.asset_suggestions(
@@ -864,6 +872,31 @@ class PortfolioApp(tk.Tk):
         self.asset_name_var.set("")
         if hasattr(self, "assets_tree"):
             self.assets_tree.selection_remove(self.assets_tree.selection())
+
+    def import_local_portfolio_to_server(self):
+        if not hasattr(self.manager, "import_local_portfolio"):
+            messagebox.showinfo("提示", "当前模式不支持导入到服务端。")
+            return
+        if not messagebox.askyesno("确认导入", "确认将本地 portfolio.json 导入服务端？重复交易会自动跳过。"):
+            return
+        try:
+            report = self.manager.import_local_portfolio()
+        except Exception as exc:
+            messagebox.showerror("导入失败", str(exc))
+            return
+        if report is None:
+            messagebox.showwarning("导入失败", "未找到本地 portfolio.json。")
+            return
+        self.refresh_all()
+        messagebox.showinfo(
+            "导入完成",
+            (
+                f"新增资产: {report.get('assets_imported', 0)}\n"
+                f"更新资产: {report.get('assets_updated', 0)}\n"
+                f"新增交易: {report.get('transactions_imported', 0)}\n"
+                f"跳过交易: {report.get('transactions_skipped', 0)}"
+            ),
+        )
 
     def run_background(self, task, on_success, busy_message, on_done=None):
         self.status_var.set(busy_message)
@@ -1149,6 +1182,16 @@ class PortfolioApp(tk.Tk):
         }
 
     def build_server_profit_chart_data(self):
+        range_start = self.get_chart_range_start()
+        if hasattr(self.manager, "build_profit_history"):
+            try:
+                return self.manager.build_profit_history(
+                    metric=self.chart_metric_var.get(),
+                    start=range_start.strftime("%Y-%m-%d %H:%M:%S") if range_start else None,
+                )
+            except Exception:
+                pass
+
         holdings = {
             asset["asset_id"]: asset
             for asset in self.manager.get_active_assets()
@@ -1159,7 +1202,6 @@ class PortfolioApp(tk.Tk):
             return {"labels": [], "series": {}, "all_series": {}, "series_meta": {}, "metric": metric, "source": "server"}
 
         server_url = self.normalize_server_url()
-        range_start = self.get_chart_range_start()
         params = {
             "asset_ids": ",".join(sorted(holdings)),
             "limit": "5000" if range_start else "0",

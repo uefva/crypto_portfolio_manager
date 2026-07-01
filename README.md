@@ -2,7 +2,31 @@
 
 股票、基金、加密货币统一持仓管理工具。图形界面支持多资产录入、人民币总资产收益、分类筛选和收益走势；命令行界面保留加密货币的基础操作。
 
-## 运行
+## 快速开始
+
+推荐先启动服务端，再启动图形界面。服务端现在同时负责价格历史和投资组合数据；图形界面会优先连接服务端，连接失败时回退读取本地 `portfolio.json`。
+
+1. 安装依赖：
+
+```bash
+pip install -r requirements.txt
+```
+
+2. 启动服务端：
+
+```bash
+python crypto_price_server.py
+```
+
+3. 启动图形界面：
+
+```bash
+python crypto_portfolio_gui.py
+```
+
+4. 首次从旧版本升级时，在图形界面“资产管理”页点击“导入本地数据到服务端”，把本地 `portfolio.json` 显式导入服务端数据库。
+
+## 运行入口
 
 命令行界面：
 
@@ -16,7 +40,7 @@ python crypto_portfolio_manager.py
 python crypto_portfolio_gui.py
 ```
 
-价格服务端：
+服务端：
 
 ```bash
 python crypto_price_server.py
@@ -58,8 +82,9 @@ crypto_portfolio/                # 应用代码
   cli.py                         # 命令行菜单和用户输入，默认处理加密货币
   gui.py                         # 图形化多资产增删改查界面和收益走势图
   market_data.py                 # 股票、基金、加密货币、汇率行情查询
-  price_server.py                # SQLite 多资产价格服务端和 HTTP 接口
-  portfolio_manager.py           # 持仓、交易、备份、人民币收益逻辑
+  price_server.py                # SQLite 价格采集、投资组合服务端和 HTTP 接口
+  portfolio_api_client.py        # GUI 调用服务端投资组合 API 的客户端
+  portfolio_manager.py           # 本地持仓、交易、备份、人民币收益逻辑和离线回退
 requirements.txt                 # Python 依赖
 portfolio.json                   # 本地持仓数据，自动升级到 v2，不提交到仓库
 portfolio_backups/               # 自动备份目录，不提交到仓库
@@ -68,7 +93,7 @@ price_history.sqlite3            # 服务端价格历史数据库，不提交到
 okx_credentials.json             # 本地凭据，不提交到仓库
 ```
 
-## 图形界面配置
+## 图形界面配置与迁移
 
 GUI 的服务端地址从 `gui_config.ini` 读取：
 
@@ -77,9 +102,27 @@ GUI 的服务端地址从 `gui_config.ini` 读取：
 url = http://120.25.206.204:8765
 ```
 
-如果配置文件不存在，或 `url` 为空，GUI 会回退到 `http://127.0.0.1:8765`。这个地址只影响“收益走势”页里“服务端价格记录”的读取；持仓录入、交易记录和本地历史快照不依赖服务端。
+如果配置文件不存在，或 `url` 为空，GUI 会回退到 `http://127.0.0.1:8765`。
 
-价格服务端只按照 `server_config.ini` 采集资产，不读取服务器本机的 `portfolio.json`。要让服务器采集股票或基金，请在配置文件中维护采集列表：
+当前 GUI 的主数据源优先级：
+
+1. 服务端投资组合 API：资产目录、交易记录、持仓、收益汇总、服务端收益曲线都优先从这里读取。
+2. 本地 `portfolio.json`：服务端不可用时作为只读回退，避免客户端无法打开。
+3. 本地 `holding_snapshots/`：仍用于保存手动查询后的持仓快照。
+
+旧版本用户迁移步骤：
+
+1. 确认 `portfolio.json` 仍在项目根目录。
+2. 启动服务端，确保 `server_config.ini` 的 `[prices] database` 指向要使用的 SQLite 文件。
+3. 启动 GUI，并确认 `gui_config.ini` 指向该服务端。
+4. 打开“资产管理”页，点击“导入本地数据到服务端”。
+5. 导入会保留原 `portfolio.json`，并在 `portfolio_backups/` 里生成备份；重复导入时，同资产同日期同类型同数量同价格的交易会自动跳过。
+
+导入后，新增/修改/删除资产和交易都会优先写入服务端数据库。
+
+## 服务端配置
+
+价格采集任务只按照 `server_config.ini` 采集资产，不会从服务器本机的 `portfolio.json` 自动生成采集列表。要让服务器采集股票或基金，请在配置文件中维护采集列表：
 
 ```ini
 [prices]
@@ -104,7 +147,7 @@ sh = 600519
 sz = 000001
 ```
 
-每个分类都可以用 `enabled = false` 单独关闭采集。GUI 的“服务端价格记录”仍会按本地持仓请求历史数据；只有该资产也出现在服务器配置里并被采集过，走势图才会有数据。
+每个分类都可以用 `enabled = false` 单独关闭采集。投资组合中的资产不等于价格采集列表：资产和交易保存在服务端投资组合表里；只有资产也出现在 `server_config.ini` 的采集列表并被采集过，服务端收益曲线才会有历史价格点。
 
 服务端采集价格时会先尝试获取全部配置资产。若部分资产失败，会按 `fetch_retries` 重试失败资产，每次重试之间等待 `retry_backoff_seconds` 秒。只有全部资产都成功获取时，本轮数据才会写入数据库；如果最终仍有失败资产，本轮状态为 `failed`，不会保存任何部分价格，避免客户端收益曲线使用不完整数据。
 
@@ -119,20 +162,32 @@ level = DEBUG
 
 ## 人民币换算逻辑
 
-每个资产都有一个本币：加密货币和美股默认 USD，港股默认 HKD，A 股和基金默认 CNY。录入买入或卖出时，系统会同时记录本币成交额和人民币成交额：
+每个资产都有一个本币：加密货币和美股默认 USD，港股默认 HKD，A 股和基金默认 CNY。录入买入或卖出时，订单只记录本币口径：
 
 ```text
 本币成交额 = 数量 * 成交价格
-人民币成交额 = 本币成交额 * 当时记录的汇率
 ```
 
-汇率优先使用用户在交易表单中手动输入的值；如果留空，则自动查询对应币种到 CNY 的汇率；如果汇率接口失败，会使用内置默认估算值。当前持仓市值用“当前价格 * 当前汇率”折算成人民币，收益用“当前人民币市值 - 历史人民币成本”计算。
+订单不再手动输入汇率，也不使用下单时汇率计算人民币成本。持仓和收益在查询时折算：
+
+```text
+当前人民币市值 = 持仓数量 * 当前价格 * 当前汇率
+当前人民币成本 = 剩余本币成本 * 当前汇率
+当前收益 = 当前人民币市值 - 当前人民币成本
+```
+
+服务端收益曲线使用历史价格点里保存的 `fx_to_cny`：
+
+```text
+历史人民币市值 = 持仓数量 * 历史 price_cny
+历史人民币成本 = 剩余本币成本 * 历史 fx_to_cny
+历史收益 = 历史人民币市值 - 历史人民币成本
+```
 
 需要注意的风险：
 
-- 如果录入历史交易时没有填写当时汇率，系统会使用录入时查询到的汇率，不一定等于真实交易日汇率。
-- 汇率接口失败并使用默认估算汇率时，人民币成本和收益会有偏差。
-- 老数据迁移缺少历史汇率，只能用迁移时的 USD/CNY 近似补齐。
+- 该口径会让非人民币资产的人民币成本随查询时汇率变化，这是当前项目的设计选择。
+- 服务端收益曲线依赖历史价格采集时保存的汇率；如果某个时间点缺少汇率，该资产不会参与该点计算。
 - 如果行情接口返回的币种异常，例如 USD 价格被当成 CNY，可能导致重复换算或少换算。
 - 服务端现在要求一轮全部资产价格采集成功才写库，用来避免部分资产缺失导致客户端收益曲线不准。
 
@@ -172,3 +227,137 @@ POST /api/refresh
 如果需要兼容旧版完整结构，可以添加 `full=1`，返回 `assets`、`prices`、`price_cny`、`fx_to_cny` 和 `sources`。服务端还支持 gzip 压缩：客户端请求头包含 `Accept-Encoding: gzip` 且响应较大时，会返回 `Content-Encoding: gzip`；常见 HTTP 客户端会自动解压。
 
 旧版本数据库中的 `price_history` 表如果存在，会在服务端启动或初始化数据库时自动迁移到新版 `asset_price_history` 表。迁移使用 `INSERT OR IGNORE`，不会覆盖新表已有的同一资产同一时间点数据。迁移后旧表不会被删除，但后续服务端不再读写旧表。
+
+## 投资组合服务端接口
+
+服务端现在也可以保存资产目录和交易记录。桌面客户端会优先连接 `gui_config.ini` 中配置的服务端；如果服务端不可用，会回退读取本地 `portfolio.json` 作为只读数据。首次迁移时，可以在客户端“资产管理”页点击“导入本地数据到服务端”。
+
+新增接口统一返回：
+
+```json
+{
+  "data": {}
+}
+```
+
+失败时返回：
+
+```json
+{
+  "error": {
+    "code": "invalid_request",
+    "message": "错误说明"
+  }
+}
+```
+
+接口列表：
+
+```text
+GET    /api/portfolio/assets
+POST   /api/portfolio/assets
+PUT    /api/portfolio/assets/{asset_id}
+DELETE /api/portfolio/assets/{asset_id}
+
+GET    /api/portfolio/transactions
+POST   /api/portfolio/transactions
+PUT    /api/portfolio/transactions/{id}
+DELETE /api/portfolio/transactions/{id}
+
+GET    /api/portfolio/holdings?category=全部
+GET    /api/portfolio/summary?category=全部
+GET    /api/portfolio/profit-history?metric=收益金额
+POST   /api/portfolio/import
+GET    /api/portfolio/export
+```
+
+投资组合数据和价格历史共用 `server_config.ini` 中 `[prices] database` 指向的 SQLite 文件。新增表包括 `portfolio_assets`、`portfolio_transactions` 和 `portfolio_meta`。订单只保存原币成交金额；持仓和收益在查询时按实时或历史汇率折算。
+
+### API 示例
+
+新增资产：
+
+```bash
+curl -X POST http://127.0.0.1:8765/api/portfolio/assets \
+  -H "Content-Type: application/json" \
+  -d '{"category":"股票","market":"US","symbol":"QQQM","name":"纳指ETF"}'
+```
+
+新增买入交易：
+
+```bash
+curl -X POST http://127.0.0.1:8765/api/portfolio/transactions \
+  -H "Content-Type: application/json" \
+  -d '{"category":"股票","market":"US","symbol":"QQQM","name":"纳指ETF","type":"buy","amount":2,"price":10,"date":"2026-01-01"}'
+```
+
+新增卖出交易：
+
+```bash
+curl -X POST http://127.0.0.1:8765/api/portfolio/transactions \
+  -H "Content-Type: application/json" \
+  -d '{"asset_id":"stock:US:QQQM","type":"sell","amount":1,"price":12,"date":"2026-01-02"}'
+```
+
+查看持仓和汇总：
+
+```bash
+curl "http://127.0.0.1:8765/api/portfolio/holdings?category=全部"
+curl "http://127.0.0.1:8765/api/portfolio/summary?category=全部"
+```
+
+导出服务端投资组合数据：
+
+```bash
+curl "http://127.0.0.1:8765/api/portfolio/export"
+```
+
+导入本地 `portfolio.json` 时，GUI 会自动读取文件并调用 `/api/portfolio/import`。如果手动调用该接口，请传入：
+
+```json
+{
+  "portfolio": {
+    "version": 2,
+    "assets": {}
+  }
+}
+```
+
+## 多端扩展路线
+
+当前迁移后的边界：
+
+- 服务端是投资组合和历史价格的主数据源。
+- 桌面 GUI 是服务端 API 的管理客户端。
+- 本地 `portfolio.json` 主要用于旧数据迁移和离线只读回退。
+
+后续增加 Web 或 App 时，应直接消费 `/api/portfolio/*` 和 `/api/assets/*`，不要再读写 `portfolio.json`。建议顺序：
+
+1. 先做 Web 管理端，复用资产、交易、持仓和收益 API。
+2. 再做移动端或 PWA，优先覆盖查看持仓、收益曲线和快速记账。
+3. 如果要开放到局域网或公网，再补 API token、CORS 白名单和 HTTPS 反代。
+
+当前服务端默认面向个人单用户、本地或内网部署，不包含账号体系。
+
+## 常见问题
+
+### 客户端显示“服务端不可用，已使用本地只读数据”
+
+检查：
+
+1. 服务端是否已启动。
+2. `gui_config.ini` 的 `url` 是否正确。
+3. 服务端端口是否被防火墙或安全组阻挡。
+4. 浏览器或命令行访问 `http://127.0.0.1:8765/api/health` 是否返回 JSON。
+
+### 服务端收益曲线没有数据
+
+常见原因：
+
+- 投资组合里已有资产，但 `server_config.ini` 没有配置这些资产的价格采集。
+- 服务端刚启动，还没有完成第一轮价格采集。
+- 某轮采集中有资产失败，服务端不会保存部分价格点。
+
+### 导入后资产有了，但收益曲线仍为空
+
+导入只迁移资产和交易，不会补历史价格。要画服务端收益曲线，需要把相关资产加入 `server_config.ini` 的采集列表，并等待服务端采集价格。

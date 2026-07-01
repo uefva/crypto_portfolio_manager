@@ -24,6 +24,7 @@ from crypto_portfolio.price_server import (
     GZIP_MIN_BYTES,
     PriceCollector,
     PriceHistoryStore,
+    PortfolioStore,
     load_config,
     make_handler,
     parse_bool,
@@ -128,6 +129,114 @@ class PriceHistoryStoreTest(unittest.TestCase):
             legacy_history = store.history(["BTC"])
             self.assertEqual(legacy_history[0]["prices"]["BTC"], 100.0)
             self.assertEqual(legacy_history[0]["sources"]["BTC"], "legacy-test")
+
+    def test_portfolio_store_assets_transactions_and_delete_rules(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = PortfolioStore(str(Path(tmpdir) / "portfolio.sqlite3"))
+            asset = store.upsert_asset(CATEGORY_STOCK, MARKET_US, "QQQM", "纳指ETF")
+            self.assertEqual(asset["name"], "纳指ETF")
+            self.assertEqual(asset["quantity"], 0)
+
+            buy = store.add_transaction({
+                "asset_id": asset["asset_id"],
+                "category": CATEGORY_STOCK,
+                "market": MARKET_US,
+                "symbol": "QQQM",
+                "type": "buy",
+                "amount": 2,
+                "price": 10,
+                "date": "2026-01-01",
+            })
+            self.assertEqual(buy["type"], "buy")
+            self.assertEqual(store.get_asset(asset["asset_id"])["quantity"], 2)
+
+            sell = store.add_transaction({
+                "asset_id": asset["asset_id"],
+                "category": CATEGORY_STOCK,
+                "market": MARKET_US,
+                "symbol": "QQQM",
+                "type": "sell",
+                "amount": 1,
+                "price": 12,
+                "date": "2026-01-02",
+            })
+            self.assertEqual(sell["type"], "sell")
+            self.assertEqual(store.get_asset(asset["asset_id"])["total_cost"], 10)
+
+            with self.assertRaises(ValueError):
+                store.delete_asset(asset["asset_id"])
+            with self.assertRaises(ValueError):
+                store.update_asset(asset["asset_id"], CATEGORY_STOCK, MARKET_US, "QQQ", "改代码")
+
+            renamed = store.update_asset(asset["asset_id"], CATEGORY_STOCK, MARKET_US, "QQQM", "新名称")
+            self.assertEqual(renamed["name"], "新名称")
+
+    def test_portfolio_import_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = PortfolioStore(str(Path(tmpdir) / "portfolio.sqlite3"))
+            payload = {
+                "version": 2,
+                "assets": {
+                    asset_id_for(CATEGORY_FUND, MARKET_FUND, "270042"): {
+                        "category": CATEGORY_FUND,
+                        "market": MARKET_FUND,
+                        "symbol": "270042",
+                        "name": "基金A",
+                        "transactions": [
+                            {
+                                "type": "buy",
+                                "date": "2026-01-01 00:00:00",
+                                "amount": 100,
+                                "price": 1.2,
+                            }
+                        ],
+                    }
+                },
+            }
+
+            first = store.import_portfolio(payload)
+            second = store.import_portfolio(payload)
+
+            self.assertEqual(first["assets_imported"], 1)
+            self.assertEqual(first["transactions_imported"], 1)
+            self.assertEqual(second["assets_updated"], 1)
+            self.assertEqual(second["transactions_skipped"], 1)
+            self.assertEqual(len(store.get_transactions()), 1)
+
+    def test_portfolio_profit_history_uses_historical_fx_for_cost(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            database = Path(tmpdir) / "portfolio.sqlite3"
+            portfolio = PortfolioStore(str(database))
+            price_store = PriceHistoryStore(str(database))
+            tx = portfolio.add_transaction({
+                "category": CATEGORY_STOCK,
+                "market": MARKET_US,
+                "symbol": "QQQM",
+                "name": "纳指ETF",
+                "type": "buy",
+                "amount": 1,
+                "price": 20,
+                "date": "2026-01-01",
+            })
+            asset_id = tx["asset_id"]
+            price_store.save_asset_quotes({
+                asset_id: {
+                    "category": CATEGORY_STOCK,
+                    "market": MARKET_US,
+                    "symbol": "QQQM",
+                    "name": "纳指ETF",
+                    "currency": "USD",
+                    "price": 18,
+                    "fx_to_cny": 7,
+                    "price_cny": 126,
+                    "source": "test",
+                }
+            }, {asset_id: portfolio.get_asset(asset_id)}, "2026-01-02 00:00:00")
+
+            history = portfolio.build_profit_history(price_store)
+
+            self.assertEqual(history["labels"], ["2026-01-02 00:00:00"])
+            self.assertEqual(history["series"]["总资产"][0][1], -14)
 
     def test_asset_history_limit_counts_time_points_not_rows(self):
         with tempfile.TemporaryDirectory() as tmpdir:
